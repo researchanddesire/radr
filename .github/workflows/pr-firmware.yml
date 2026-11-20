@@ -197,7 +197,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     # Use the exact reviewed wrapper commit allowed by the runner group.
     # Runner-group access is restricted to this full workflow path and ref.
-    uses: researchanddesire/Open-Source-Wireless-Remote_RADR/.github/workflows/hardware-run.yml@ec0a99d8fc9a8b7e1c9a8c84d48ec619174ad0b3
+    uses: researchanddesire/radr/.github/workflows/hardware-run.yml@d7541b22e99cf87feb064cda7229a7bff4cc8745
   hardware_required:
     name: Hardware validation
     if: always()
