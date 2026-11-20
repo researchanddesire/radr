@@ -1,9 +1,9 @@
 # RADR - OSSM Wireless Remote
 **RADR** (pronounced like "radar") is a user friendly every day sex machine controller for the people. It's designed to simply and easily allow you to control many bluetooth sex toys, without reaching for your cellphone.
 
-It was originally designed to control the [Open Source Sex Machine](https://docs.researchanddesire.com/ossm/guides/getting-started/introduction), but it can control much more!&#x20;
+It was originally designed to control the [Open Source Sex Machine](https://docs.researchanddesire.com/ossm), but it can control much more!&#x20;
 
-Check out the [user documentation](https://docs.researchanddesire.com/radr/guides/getting-started/introduction)
+Check out the [user documentation](https://docs.researchanddesire.com/radr/guides/getting-started)
 
 You can purchase complete remotes and OSSM kits on our shop - [RADR Product Page](https://www.researchanddesire.com/products/radr-ossm-wireless-remote)
 <p align="center">
