@@ -234,6 +234,9 @@ def validation_payload(release_id: str, layer: str, status: str, args: argparse.
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     workflow_url = f"https://github.com/{repository}/actions/runs/{run_id}"
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+    if attempt.isdecimal():
+        workflow_url += f"/attempts/{attempt}"
     payload: dict[str, Any] = {
         "releaseId": release_id,
         "layer": layer,
@@ -243,7 +246,14 @@ def validation_payload(release_id: str, layer: str, status: str, args: argparse.
         "runner": os.environ.get("RUNNER_NAME", "github-actions"),
     }
     if repository and run_id:
-        payload["workflowRunUrl"] = workflow_url
+        links = json.loads(os.environ.get("FIRMWARE_VALIDATION_LOG_LINKS") or "{}")
+        payload["workflowRunUrl"] = links.get(layer, workflow_url)
+        if layer == "build":
+            merged_pr = os.environ.get("FIRMWARE_MERGED_PR", "")
+            payload["summary"] = {
+                "event": os.environ.get("GITHUB_EVENT_NAME"),
+                "mergedPr": int(merged_pr) if merged_pr.isdecimal() else None,
+            }
     return payload
 
 
