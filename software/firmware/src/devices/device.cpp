@@ -11,6 +11,7 @@
 Device *device = nullptr;
 
 portMUX_TYPE Device::lifecycleLock = portMUX_INITIALIZER_UNLOCKED;
+std::atomic<int> Device::runningConnectionTasks{0};
 
 namespace {
 // The connection procedure needs about 4 KB; the rest is headroom for the
@@ -53,6 +54,9 @@ bool Device::startConnection() {
     portENTER_CRITICAL(&lifecycleLock);
     connectionTaskRunning = true;
     portEXIT_CRITICAL(&lifecycleLock);
+    // Counted before the task exists, so a BLE shutdown that starts now
+    // waits for it (see waitForConnectionTasks()).
+    runningConnectionTasks++;
 
     BaseType_t created;
     if (connectionUsesPsramStack) {
@@ -67,6 +71,7 @@ bool Device::startConnection() {
             this, 1, &connectionTaskHandle, 0, kInternalStackWaitMs);
     }
     if (created != pdPASS) {
+        runningConnectionTasks--;
         portENTER_CRITICAL(&lifecycleLock);
         connectionTaskRunning = false;
         portEXIT_CRITICAL(&lifecycleLock);
@@ -130,8 +135,6 @@ void Device::deleteLater(Device *target) {
     }
 }
 
-std::atomic<int> Device::runningConnectionTasks{0};
-
 bool Device::waitForConnectionTasks(uint32_t timeoutMs) {
     const TickType_t start = xTaskGetTickCount();
     while (runningConnectionTasks.load() > 0) {
@@ -144,7 +147,6 @@ bool Device::waitForConnectionTasks(uint32_t timeoutMs) {
 
 void Device::connectionTask(void *pvParameter) {
     Device *self = static_cast<Device *>(pvParameter);
-    runningConnectionTasks++;
     const bool usesPsramStack = self->connectionUsesPsramStack;
 
     const bool ready = self->connectSteps();
