@@ -5,6 +5,10 @@
 
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+#include <atomic>
 #include <components/DisplayObject.h>
 #include <functional>
 #include <memory>
@@ -32,6 +36,39 @@ struct DeviceCharacteristics {
     NimBLERemoteCharacteristic::notify_callback notifyCallback = nullptr;
 };
 
+// Lets a BLE notification callback run only while its device exists.
+// NimBLE keeps the callback on its (reused) client after the device is
+// deleted, so every device callback goes through one of these.
+struct NotifyGate {
+    SemaphoreHandle_t mutex = xSemaphoreCreateMutex();
+    bool open = true;
+
+    ~NotifyGate() {
+        if (mutex != nullptr) vSemaphoreDelete(mutex);
+    }
+
+    // Waits for a running callback, then turns later ones into no-ops.
+    void close() {
+        if (mutex == nullptr) return;
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        open = false;
+        xSemaphoreGive(mutex);
+    }
+
+    static NimBLERemoteCharacteristic::notify_callback wrap(
+        const std::shared_ptr<NotifyGate> &gate,
+        NimBLERemoteCharacteristic::notify_callback callback) {
+        return [gate, callback](NimBLERemoteCharacteristic *characteristic,
+                                uint8_t *data, size_t length, bool isNotify) {
+            if (gate->mutex == nullptr ||
+                xSemaphoreTake(gate->mutex, portMAX_DELAY) != pdTRUE)
+                return;
+            if (gate->open) callback(characteristic, data, length, isNotify);
+            xSemaphoreGive(gate->mutex);
+        };
+    }
+};
+
 struct DeviceDisplayObject {
     std::string name;
     DisplayObject *displayObject;
@@ -39,9 +76,13 @@ struct DeviceDisplayObject {
 
 class Device : public NimBLEClientCallbacks {
   public:
-    const NimBLEAdvertisedDevice *advertisedDevice;
-    NimBLEClient *pClient;
-    NimBLERemoteService *pService;
+    // The advertisement this device was created from. The device keeps its
+    // own copy: every new scan frees the scanner's results, and the
+    // connection task and Buttplug devices read it long after the scan.
+    const NimBLEAdvertisedDevice advertised;
+    const NimBLEAdvertisedDevice *const advertisedDevice = &advertised;
+    NimBLEClient *pClient = nullptr;
+    NimBLERemoteService *pService = nullptr;
 
     bool isConnected = false;
     bool isPaused = false;
@@ -53,11 +94,40 @@ class Device : public NimBLEClientCallbacks {
     std::unordered_map<std::string, DeviceCharacteristics> characteristics;
     std::vector<std::unique_ptr<DisplayObject>> displayObjects;
 
-    // Constructor with settings document size parameter
     explicit Device(const NimBLEAdvertisedDevice *advertisedDevice);
 
-    // Virtual destructor for proper cleanup
+    // Delete a device with destroy(), never with delete: the connection task
+    // may still be using it.
     virtual ~Device();
+
+    Device(const Device &) = delete;
+    Device &operator=(const Device &) = delete;
+
+    // Starts connecting on the connection task. Call once, after the device
+    // is fully constructed. False when the task could not be created.
+    bool startConnection();
+
+    // Stops the connection attempt and deletes the device: now, or when its
+    // connection task finishes if one is still running (it may be blocked in
+    // a BLE read). Safe to call from the connection task itself.
+    static void destroy(Device *device);
+
+    // True when connecting never touches flash (NVS, LittleFS), so the
+    // connection task can run on a PSRAM stack. Devices that load files
+    // while connecting keep the default internal-RAM stack.
+    virtual bool connectsWithoutFlash() const { return false; }
+
+    // Called once by destroy() before the link is dropped, while it may
+    // still be up and no connection task runs: stop outputs here.
+    virtual void onTeardown() {}
+
+    // True once destroy() was called; connection steps stop early.
+    bool connectionAborted() const { return aborted; }
+
+    // Waits until no connection task is running (a destroyed device's task
+    // can outlive it briefly). False on timeout. NimBLE must not be
+    // deinitialised while one runs: it deletes the clients the task uses.
+    static bool waitForConnectionTasks(uint32_t timeoutMs);
 
     // Virtual methods that child classes can optionally override
     virtual void onRightBumperClick() {}
@@ -143,8 +213,10 @@ class Device : public NimBLEClientCallbacks {
     }
 
   protected:
-    TaskHandle_t connectionTaskHandle;
     static void connectionTask(void *pvParameter);
+    // Runs the connection steps; false when the device must not report
+    // itself connected.
+    bool connectSteps();
 
     void onConnect(NimBLEClient *pClient) override;
 
@@ -196,8 +268,21 @@ class Device : public NimBLEClientCallbacks {
     // Legacy method - now returns a copy of the JSON as string for safety
     std::string readJsonString(const std::string &command);
 
+    std::shared_ptr<NotifyGate> notifyGate;
+
   private:
-    void startConnectionTask();
+    static std::atomic<int> runningConnectionTasks;
+    // Frees `target` after a short grace period (see destroy()).
+    static void deleteLater(Device *target);
+    // Drops the link and NimBLE's callbacks into this device.
+    void releaseClient();
+    // Guards connectionTaskRunning and deleteWhenConnectionEnds.
+    static portMUX_TYPE lifecycleLock;
+    TaskHandle_t connectionTaskHandle = nullptr;
+    bool connectionTaskRunning = false;
+    bool deleteWhenConnectionEnds = false;
+    volatile bool aborted = false;
+    bool connectionUsesPsramStack = false;
 };
 
 #endif  // DEVICE_H

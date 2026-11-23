@@ -20,7 +20,7 @@ struct ossm_remote_state {
 
             "device_search"_s + on_entry<_> / (drawPage(deviceSearchPage), search, []() { setLed(LEDColors::logoBlue, 255, 1500); }),
             "device_search"_s + event<devices_found_event> = "device_list"_s,
-            "device_search"_s + event<connected_event> = "device_draw_control"_s,
+            "device_search"_s + event<connected_event>[isCurrentConnection] = "device_draw_control"_s,
             "device_search"_s + event<left_button_pressed> / disconnect = "main_menu"_s,
 
             "device_list"_s + on_entry<_> / drawDeviceList,
@@ -29,8 +29,9 @@ struct ossm_remote_state {
             "device_list"_s + event<left_button_pressed> / (disconnect, clearDeviceList) = "main_menu"_s,
 
             "device_connecting"_s + on_entry<_> / drawPage(deviceConnectingPage),
-            "device_connecting"_s + event<connected_event> = "device_draw_control"_s,
-            "device_connecting"_s + event<connected_error_event> = "device_list"_s,
+            "device_connecting"_s + event<connected_event>[isCurrentConnection] = "device_draw_control"_s,
+            "device_connecting"_s + event<connected_error_event> / disconnectQuiet = "device_list"_s,
+            "device_connecting"_s + event<disconnected_event> / disconnect = "device_list"_s,
             "device_connecting"_s + event<left_button_pressed> / disconnect = "device_list"_s,
 
             "main_menu"_s + on_entry<_> / drawMainMenu,
@@ -47,7 +48,7 @@ struct ossm_remote_state {
             "main_menu"_s + event<right_button_pressed>[isOption<>(MenuItemE::OSSM_UPDATE)] = "ossm_update_check"_s,
             "main_menu"_s + event<left_button_pressed>[isConnected && isSimplePenetrationMode] / start = "simple_penetration_control"_s,
             "main_menu"_s + event<left_button_pressed>[isConnected] / start = "device_draw_control"_s,
-            "main_menu"_s + event<connected_event> / start = "device_draw_control"_s,
+            "main_menu"_s + event<connected_event>[isCurrentConnection] / start = "device_draw_control"_s,
             "main_menu"_s + event<disconnected_event> / disconnect,
 
 

@@ -19,13 +19,26 @@
 
 static const char *TAG_COMS = "COMS";
 
-static const NimBLEAdvertisedDevice *advDevice;
-static bool doConnect = false;
-static uint32_t scanTimeMs =
-    0; /** scan time in milliseconds, 0 = scan forever */
+// More than fit on the device list; bounds the memory a crowded room costs.
+static constexpr size_t kMaxDiscoveredDevices = 16;
 
 static std::queue<String> commandQueue;
+// Written by the BLE host task (scan results) and read by the UI and the
+// state machine; every access holds discoveredDevicesLock.
 static std::vector<DiscoveredDevice> discoveredDevices;
+namespace {
+SemaphoreHandle_t discoveredDevicesLock() {
+    static SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+    return lock;
+}
+
+struct DiscoveredDevicesGuard {
+    DiscoveredDevicesGuard() { xSemaphoreTake(discoveredDevicesLock(), portMAX_DELAY); }
+    ~DiscoveredDevicesGuard() { xSemaphoreGive(discoveredDevicesLock()); }
+    DiscoveredDevicesGuard(const DiscoveredDevicesGuard &) = delete;
+    DiscoveredDevicesGuard &operator=(const DiscoveredDevicesGuard &) = delete;
+};
+}  // namespace
 
 struct ScanMonitorRequest {
     int timeoutMs;
@@ -78,22 +91,24 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         }
 
         // Check if device already exists in list (by address)
-        std::string address = advertisedDevice->getAddress().toString();
+        const NimBLEAddress address = advertisedDevice->getAddress();
+        DiscoveredDevicesGuard guard;
         for (auto &dev : discoveredDevices) {
-            if (dev.advertisedDevice->getAddress().toString() == address) {
+            if (dev.advertisement.getAddress() == address) {
                 // Update RSSI if device already in list
                 dev.rssi = advertisedDevice->getRSSI();
                 return;
             }
         }
+        if (discoveredDevices.size() >= kMaxDiscoveredDevices) return;
 
         // Add new device to list
         DiscoveredDevice newDevice;
-        newDevice.advertisedDevice = advertisedDevice;
+        newDevice.advertisement = *advertisedDevice;
         newDevice.factory = factory;
         newDevice.name = advertisedDevice->getName().c_str();
         newDevice.rssi = advertisedDevice->getRSSI();
-        discoveredDevices.push_back(newDevice);
+        discoveredDevices.push_back(std::move(newDevice));
 
         ESP_LOGI(TAG_COMS, "Found device: %s (RSSI: %d)",
                  newDevice.name.c_str(), newDevice.rssi);
@@ -119,17 +134,6 @@ void notifyCB(NimBLERemoteCharacteristic *pRemoteCharacteristic, uint8_t *pData,
     str += ", Value = " + std::string((char *)pData, length);
 
     ESP_LOGV(TAG_COMS, "%s", str.c_str());
-}
-
-/** Handles the provisioning of clients and connects / interfaces with the
- * server */
-bool connectToServer() {
-    if (advDevice == nullptr) {
-        ESP_LOGE(TAG_COMS, "connectToServer called with null advDevice");
-        return false;
-    }
-
-    return true;
 }
 
 void sendCommand(const String &command) {
@@ -189,6 +193,12 @@ void initBLE() {
 
     /** Set the callbacks to call when scan events occur, no duplicates */
     pScan->setScanCallbacks(&scanCallbacks, false);
+    // Keep no scan results in NimBLE: the callback copies the few supported
+    // devices into discoveredDevices. Stored results were one small
+    // internal-RAM block per advertiser in range (dozens in a busy room),
+    // freed and re-allocated on every scan, which fragmented the internal
+    // heap the BLE connection and OTA tasks need.
+    pScan->setMaxResults(0);
 
     /** Set scan interval (how often) and window (how long) in milliseconds */
     pScan->setInterval(100);
@@ -219,30 +229,59 @@ void initBLE() {
     ESP_LOGI(TAG_COMS, "Scanning for peripherals");
 }
 
-std::vector<DiscoveredDevice> &getDiscoveredDevices() {
+std::vector<DiscoveredDevice> getDiscoveredDevices() {
+    DiscoveredDevicesGuard guard;
     return discoveredDevices;
 }
 
+size_t getDiscoveredDeviceCount() {
+    DiscoveredDevicesGuard guard;
+    return discoveredDevices.size();
+}
+
 void clearDiscoveredDevices() {
+    DiscoveredDevicesGuard guard;
     discoveredDevices.clear();
+    discoveredDevices.shrink_to_fit();
     ESP_LOGI(TAG_COMS, "Cleared discovered devices list");
 }
 
 void connectToDiscoveredDevice(int index) {
-    if (index < 0 || index >= discoveredDevices.size()) {
-        ESP_LOGE(TAG_COMS, "Invalid device index: %d", index);
-        return;
+    DiscoveredDevice selected;
+    {
+        DiscoveredDevicesGuard guard;
+        if (index < 0 || index >= (int)discoveredDevices.size()) {
+            ESP_LOGE(TAG_COMS, "Invalid device index: %d", index);
+            fireStateMachineConnectedErrorEvent();
+            return;
+        }
+        selected = discoveredDevices[index];
     }
-
-    const DiscoveredDevice &selectedDevice = discoveredDevices[index];
-    ESP_LOGI(TAG_COMS, "Connecting to device: %s", selectedDevice.name.c_str());
+    ESP_LOGI(TAG_COMS, "Connecting to device: %s", selected.name.c_str());
 
     // Stop scanning
     NimBLEDevice::getScan()->stop();
 
-    // Create device instance
-    advDevice = selectedDevice.advertisedDevice;
-    device = (*selectedDevice.factory)(selectedDevice.advertisedDevice);
+    // A device left over from an earlier attempt must not leak or keep its
+    // client callbacks.
+    if (device != nullptr) {
+        Device *leftover = device;
+        device = nullptr;
+        Device::destroy(leftover);
+    }
+
+    // Create device instance; it copies the advertisement.
+    Device *created = (*selected.factory)(&selected.advertisement);
+    if (created == nullptr) {
+        updateStatusText("This device is not supported.");
+        fireStateMachineConnectedErrorEvent();
+        return;
+    }
+    device = created;
+    if (!created->startConnection()) {
+        // The connected_error_event transition destroys the device.
+        fireStateMachineConnectedErrorEvent();
+    }
 }
 
 bool startScanWithTimeout(int timeoutMs, void (*onComplete)()) {

@@ -449,7 +449,7 @@ static volatile bool deviceListTaskExitRequested = false;
 void buildDeviceListMenu() {
     deviceListMenu.clear();
     
-    auto& devices = getDiscoveredDevices();
+    const auto devices = getDiscoveredDevices();
     
     if (devices.empty()) {
         // Add a "No devices found" placeholder

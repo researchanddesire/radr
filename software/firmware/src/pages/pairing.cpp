@@ -196,7 +196,9 @@ static void followOssmFlow(const char *prefix) {
     }
 }
 
-static void ossmPairingTask(void *) {
+// Runs the request; returns (so its strings are freed) before the task
+// deletes itself.
+static void ossmPairingTaskSteps() {
     ESP_LOGW(PAIRING_TAG, "[MEM] request: internal free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
@@ -209,19 +211,21 @@ static void ossmPairingTask(void *) {
         // never fired). Treat it as a disconnect so the RADR cleans up.
         updateStatusText("Lost the OSSM connection.");
         fireStateMachineOssmLinkLostEvent();
-        vTaskDelete(nullptr);
         return;
     }
     ESP_LOGI(PAIRING_TAG, "OSSM pairing info: %s", pairingInfo.c_str());
 
     if (!pairingInfoHasWifi(pairingInfo)) {
         fireStateMachineOssmNoWifiEvent();
-        vTaskDelete(nullptr);
         return;
     }
 
     if (device != nullptr) device->onPairing();
     followOssmFlow("pairing");
+}
+
+static void ossmPairingTask(void *) {
+    ossmPairingTaskSteps();
     vTaskDelete(nullptr);
 }
 

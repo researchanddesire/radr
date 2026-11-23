@@ -30,6 +30,18 @@ static void postTaskFailedEvent(void *, uint32_t) {
     }
 }
 
+// Deferred like task_failed_event: device selection runs inside a
+// transition action.
+static void postConnectedErrorEvent(void *, uint32_t) {
+    if (stateMachine) {
+        stateMachine->process_event(connected_error_event{});
+    }
+}
+
+void fireStateMachineConnectedErrorEvent() {
+    xTimerPendFunctionCall(postConnectedErrorEvent, nullptr, 0, pdMS_TO_TICKS(10));
+}
+
 void fireStateMachineTaskFailedEvent() {
     xTimerPendFunctionCall(postTaskFailedEvent, nullptr, 0, pdMS_TO_TICKS(10));
 }

@@ -10,273 +10,336 @@
 
 Device *device = nullptr;
 
+portMUX_TYPE Device::lifecycleLock = portMUX_INITIALIZER_UNLOCKED;
+
+namespace {
+// The connection procedure needs about 4 KB; the rest is headroom for the
+// device's onConnect() and the state machine work it triggers.
+constexpr uint32_t kConnectionStackBytes = 10 * configMINIMAL_STACK_SIZE;
+constexpr uint32_t kInternalStackWaitMs = 4000;
+}  // namespace
+
 Device::Device(const NimBLEAdvertisedDevice *advertisedDevice)
-    : advertisedDevice(advertisedDevice) {
-    startConnectionTask();
-}
+    : advertised(advertisedDevice != nullptr ? *advertisedDevice
+                                             : NimBLEAdvertisedDevice()),
+      notifyGate(std::make_shared<NotifyGate>()) {}
 
 Device::~Device() {
+    // Notification callbacks stay registered on NimBLE's client after this
+    // device is gone; the gate makes them no-ops from here on.
+    notifyGate->close();
+
     displayObjects.clear();
-    ESP_LOGD(TAG, "Cleared %zu display objects", displayObjects.size());
-
-    // Clear characteristics map (pointers are managed by NimBLE)
     characteristics.clear();
-    ESP_LOGD(TAG, "Cleared characteristics map");
-
-    // Clear menu
     menu.clear();
-    ESP_LOGD(TAG, "Cleared menu");
 
-    // clear te client callbacks so that we don't call "this->onDisconnect()"
+    // Clear the client callbacks so that we don't call "this->onDisconnect()"
     if (pClient) {
-        pClient->setClientCallbacks(nullptr, true);
-
+        pClient->setClientCallbacks(nullptr, false);
         pClient->disconnect();
-
         pClient = nullptr;
     }
 
     ESP_LOGD(TAG, "Device destructor completed");
 }
 
+bool Device::startConnection() {
+    // OSSM-style devices never touch flash while connecting, so their task
+    // can live in PSRAM. Internal RAM is nearly full once Wi-Fi and BLE run
+    // and fragments over connect/disconnect cycles; the internal stack is
+    // kept only for devices that read LittleFS here (Buttplug protocol
+    // files), which a PSRAM stack cannot do.
+    connectionUsesPsramStack = connectsWithoutFlash() && psramFound();
+    portENTER_CRITICAL(&lifecycleLock);
+    connectionTaskRunning = true;
+    portEXIT_CRITICAL(&lifecycleLock);
+
+    BaseType_t created;
+    if (connectionUsesPsramStack) {
+        created = createPsramTask(Device::connectionTask, "connectionTask",
+                                  kConnectionStackBytes, this, 1,
+                                  &connectionTaskHandle, 0);
+        // createPsramTask falls back to an internal stack on its own.
+        if (created == pdPASS) connectionUsesPsramStack = isPsramTask(connectionTaskHandle);
+    } else {
+        created = createInternalTaskWithWait(
+            Device::connectionTask, "connectionTask", kConnectionStackBytes,
+            this, 1, &connectionTaskHandle, 0, kInternalStackWaitMs);
+    }
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&lifecycleLock);
+        connectionTaskRunning = false;
+        portEXIT_CRITICAL(&lifecycleLock);
+        connectionTaskHandle = nullptr;
+        updateStatusText("Out of memory: cannot connect.");
+        return false;
+    }
+    return true;
+}
+
+void Device::releaseClient() {
+    NimBLEClient *client = pClient;
+    if (client == nullptr) return;
+    client->setClientCallbacks(nullptr, false);
+    if (client->isConnected()) {
+        client->disconnect();
+    } else {
+        client->cancelConnect();
+    }
+}
+
+void Device::destroy(Device *target) {
+    if (target == nullptr) return;
+    target->aborted = true;
+
+    portENTER_CRITICAL(&lifecycleLock);
+    const bool running = target->connectionTaskRunning;
+    if (running) target->deleteWhenConnectionEnds = true;
+    portEXIT_CRITICAL(&lifecycleLock);
+
+    if (!running) target->onTeardown();
+    // Stop the link: a connection task blocked in a BLE read or in connect()
+    // returns as soon as it is gone.
+    target->releaseClient();
+    if (running) {
+        ESP_LOGW(TAG, "Connection task still running; it deletes the device");
+        return;
+    }
+    target->pClient = nullptr;
+    deleteLater(target);
+}
+
+namespace {
+// Other tasks (RAD BLE requests, input handlers) read the global `device`
+// and may be inside one of its methods when it is cleared. They finish
+// within this; the link is already down, so their BLE calls fail fast.
+constexpr uint32_t kDeleteGraceMs = 1500;
+
+void deleteDeviceTask(void *param) {
+    vTaskDelay(pdMS_TO_TICKS(kDeleteGraceMs));
+    delete static_cast<Device *>(param);
+    exitPsramTask();
+}
+}  // namespace
+
+void Device::deleteLater(Device *target) {
+    // No flash access in a device destructor, so a PSRAM stack is fine.
+    if (createPsramTask(deleteDeviceTask, "deviceDelete", 4096, target, 1,
+                        nullptr, tskNO_AFFINITY) != pdPASS) {
+        delete target;
+    }
+}
+
+std::atomic<int> Device::runningConnectionTasks{0};
+
+bool Device::waitForConnectionTasks(uint32_t timeoutMs) {
+    const TickType_t start = xTaskGetTickCount();
+    while (runningConnectionTasks.load() > 0) {
+        if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeoutMs))
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return true;
+}
+
 void Device::connectionTask(void *pvParameter) {
-    Device *device = (Device *)pvParameter;
-    const NimBLEAdvertisedDevice *advDevice = device->advertisedDevice;
-    bool connected = false;
+    Device *self = static_cast<Device *>(pvParameter);
+    runningConnectionTasks++;
+    const bool usesPsramStack = self->connectionUsesPsramStack;
+
+    const bool ready = self->connectSteps();
+    if (!self->aborted && stateMachine) {
+        // The guard on connected_event drops it if this device is no longer
+        // the current one by the time the state machine sees it.
+        if (ready) {
+            connected_event event;
+            event.source = self;
+            stateMachine->process_event(event);
+        } else {
+            stateMachine->process_event(connected_error_event());
+        }
+    }
+    ESP_LOGD(TAG, "Connection task done (stack headroom %u bytes)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    portENTER_CRITICAL(&lifecycleLock);
+    self->connectionTaskRunning = false;
+    self->connectionTaskHandle = nullptr;
+    const bool deleteSelf = self->deleteWhenConnectionEnds;
+    portEXIT_CRITICAL(&lifecycleLock);
+    if (deleteSelf) {
+        // destroy() ran while this task was busy; the link may have come up
+        // after it asked for a disconnect.
+        self->releaseClient();
+        self->pClient = nullptr;
+        deleteLater(self);
+    }
+    runningConnectionTasks--;
+    if (usesPsramStack) exitPsramTask();
+    vTaskDelete(NULL);
+}
+
+bool Device::connectSteps() {
+    Device *device = this;  // shadows the global on purpose
+    const NimBLEAdvertisedDevice *advDevice = advertisedDevice;
+    const NimBLEAddress address = advDevice->getAddress();
 
     updateStatusText("Initializing connection...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (aborted) return false;
 
-    while (true) {
-        ESP_LOGI(TAG, "Connection task running");
-
-        vTaskDelay(1000);
-        NimBLEClient *pClient = nullptr;
-
+    NimBLEClient *client = nullptr;
+    for (int attempt = 0; attempt < 2 && client == nullptr; attempt++) {
+        if (aborted) return false;
         /** Check if we have a client we should reuse first **/
         if (NimBLEDevice::getCreatedClientCount()) {
             updateStatusText("Checking existing connections...");
-            ESP_LOGD(TAG, "Existing clients detected: %u",
-                     NimBLEDevice::getCreatedClientCount());
-            if (advDevice) {
-                ESP_LOGD(TAG,
-                         "Attempting reuse with peer: %s (RSSI during adv: %d)",
-                         advDevice->getAddress().toString().c_str(),
-                         advDevice->getRSSI());
-            }
-
             /**
              *  Special case when we already know this device, we send false as
              * the second argument in connect() to prevent refreshing the
              * service database. This saves considerable time and power.
              */
-            pClient =
-                NimBLEDevice::getClientByPeerAddress(advDevice->getAddress());
-            if (pClient) {
-                // Re-register callbacks — previous Device destructor cleared
-                // them, so the reused client has no callbacks set.
-                pClient->setClientCallbacks(device, false);
+            NimBLEClient *known = NimBLEDevice::getClientByPeerAddress(address);
+            if (known) {
+                // Re-register callbacks — the previous device cleared them.
+                known->setClientCallbacks(device, false);
+                pClient = known;
                 updateStatusText("Attempting fast reconnect...");
-                ESP_LOGD(TAG,
-                         "Found existing client for peer: %s; attempting fast "
-                         "reconnect (no svc refresh)",
-                         advDevice->getAddress().toString().c_str());
-                if (!pClient->connect(advDevice, false)) {
+                if (!known->connect(address, false)) {
+                    pClient = nullptr;
+                    known->setClientCallbacks(nullptr, false);
+                    if (aborted) return false;
                     updateStatusText("Reconnection failed, retrying...");
-                    ESP_LOGE(
-                        TAG,
-                        "Reconnect failed, deleting client and trying again.");
-                    NimBLEDevice::deleteClient(pClient);
-                    connected = false;
+                    ESP_LOGE(TAG,
+                             "Reconnect failed, deleting client and trying again.");
+                    NimBLEDevice::deleteClient(known);
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     continue;
                 }
                 ESP_LOGI(TAG, "Reconnected client");
-            } else {
-                /**
-                 *  We don't already have a client that knows this device,
-                 *  check for a client that is disconnected that we can use.
-                 *
-                 *  NOTE: Reusing disconnected clients for DIFFERENT devices
-                 *  can cause connection issues. Delete stale clients instead
-                 *  and create a fresh one for reliable connections.
-                 */
-                ESP_LOGD(TAG,
-                         "No existing client for peer; searching for "
-                         "disconnected client slot");
-                pClient = NimBLEDevice::getDisconnectedClient();
-                if (pClient) {
-                    ESP_LOGD(TAG,
-                             "Found disconnected client, deleting it to create "
-                             "fresh connection");
-                    NimBLEDevice::deleteClient(pClient);
-                    pClient = nullptr;  // Will create new client below
-                } else {
-                    ESP_LOGD(TAG,
-                             "No disconnected clients available; will create a "
-                             "new client");
-                }
+                client = known;
+                break;
             }
+            /**
+             *  Reusing disconnected clients for DIFFERENT devices can cause
+             *  connection issues. Delete stale clients instead and create a
+             *  fresh one for reliable connections.
+             */
+            NimBLEClient *stale = NimBLEDevice::getDisconnectedClient();
+            if (stale) NimBLEDevice::deleteClient(stale);
         }
-
-        vTaskDelay(1);
 
         /** No client to reuse? Create a new one. */
-        if (!pClient) {
-            updateStatusText("Creating new connection...");
-            ESP_LOGD(TAG, "No client to reuse, creating new client");
-            if (NimBLEDevice::getCreatedClientCount() >=
-                NIMBLE_MAX_CONNECTIONS) {
-                updateStatusText("Connection limit reached!");
-                ESP_LOGE(TAG,
-                         "Max clients reached - no more connections available");
-                connected = false;
-
-                // TODO: Schedule for deleting and throw error.
-                break;
-            }
-
-            ESP_LOGD(TAG, "Creating new client");
-            pClient = NimBLEDevice::createClient();
-
-            ESP_LOGI(TAG, "New client created");
-
-            pClient->setClientCallbacks(device, false);
-            /**
-             *  Set initial connection parameters:
-             *  These settings are safe for 3 clients to connect reliably, can
-             * go faster if you have less connections. Timeout should be a
-             * multiple of the interval, minimum is 100ms. Min interval: 12
-             * * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 150 *
-             * 10ms = 1500ms timeout
-             */
-            pClient->setConnectionParams(12, 12, 0, 150);
-            ESP_LOGD(TAG,
-                     "Connection params set: min_itvl=12, max_itvl=12, "
-                     "latency=0, timeout=1500ms");
-
-            /** Set how long we are willing to wait for the connection to
-             * complete (milliseconds), default is 30000. */
-            pClient->setConnectTimeout(5 * 1000);
-            ESP_LOGD(TAG, "Connect timeout set: %dms", 5 * 1000);
-
-            ESP_LOGI(TAG, "Connecting to peer (new client): %s",
-                     advDevice->getAddress().toString().c_str());
-            updateStatusText(String("Connecting to ") +
-                             advDevice->getAddress().toString().c_str() +
-                             "...");
-            vTaskDelay(11);
-            // exchangeMTU stays false on purpose. NimBLE-Arduino 2.4.0's
-            // client read callback copies OS_MBUF_PKTLEN bytes from the first
-            // mbuf block only (NimBLERemoteValueAttribute.cpp onReadCB), so
-            // with a negotiated MTU any single response larger than one
-            // block (~250 B, e.g. the OSSM state JSON) comes back with a
-            // garbage tail (measured 2026-09-11: every read truncated at
-            // 279 B). At MTU 23 every response is a small blob and long
-            // reads are reassembled correctly.
-            if (!pClient->connect(advDevice, true, false, false)) {
-                updateStatusText("Connection failed, please try again.");
-                /** Created a client but failed to connect, don't need to keep
-                 * it as it has no data */
-                NimBLEDevice::deleteClient(pClient);
-                ESP_LOGE(TAG, "Failed to connect, deleted client");
-                connected = false;
-                break;
-            }
-            ESP_LOGD(TAG, "Initial connect (new client) succeeded");
+        updateStatusText("Creating new connection...");
+        if (NimBLEDevice::getCreatedClientCount() >= NIMBLE_MAX_CONNECTIONS) {
+            updateStatusText("Connection limit reached!");
+            ESP_LOGE(TAG, "Max clients reached - no more connections available");
+            return false;
         }
 
+        NimBLEClient *created = NimBLEDevice::createClient();
+        if (created == nullptr) {
+            updateStatusText("Out of memory: cannot connect.");
+            return false;
+        }
+        created->setClientCallbacks(device, false);
+        /**
+         *  Initial connection parameters: safe for 3 clients. Min/max
+         * interval 12 * 1.25 ms = 15 ms, 0 latency, 150 * 10 ms = 1500 ms
+         * supervision timeout.
+         */
+        created->setConnectionParams(12, 12, 0, 150);
+        /** How long we are willing to wait for the connection (ms). */
+        created->setConnectTimeout(5 * 1000);
+        pClient = created;
+
+        ESP_LOGI(TAG, "Connecting to peer (new client): %s",
+                 address.toString().c_str());
+        updateStatusText(String("Connecting to ") + address.toString().c_str() +
+                         "...");
+        // exchangeMTU stays false on purpose. NimBLE-Arduino 2.4.0's
+        // client read callback copies OS_MBUF_PKTLEN bytes from the first
+        // mbuf block only (NimBLERemoteValueAttribute.cpp onReadCB), so
+        // with a negotiated MTU any single response larger than one
+        // block (~250 B, e.g. the OSSM state JSON) comes back with a
+        // garbage tail (measured 2026-09-11: every read truncated at
+        // 279 B). At MTU 23 every response is a small blob and long
+        // reads are reassembled correctly.
+        if (!created->connect(address, true, false, false)) {
+            pClient = nullptr;
+            created->setClientCallbacks(nullptr, false);
+            /** Created a client but failed to connect, don't need to keep
+             * it as it has no data */
+            NimBLEDevice::deleteClient(created);
+            if (!aborted) updateStatusText("Connection failed, please try again.");
+            ESP_LOGE(TAG, "Failed to connect, deleted client");
+            return false;
+        }
+        client = created;
+    }
+    if (client == nullptr || aborted) return false;
+
+    if (!client->isConnected()) {
+        updateStatusText("Connection failed, please try again.");
+        ESP_LOGE(TAG, "Client reports connected but has no link");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Connected to: %s RSSI: %d",
+             client->getPeerAddress().toString().c_str(), client->getRssi());
+    updateStatusText("Connected! Setting up device...");
+
+    pService = client->getService(getServiceUUID());
+    if (pService == nullptr) {
+        updateStatusText("Device service not found!");
+        ESP_LOGE(TAG, "Service not found");
+        return false;
+    }
+
+    // for each characteristic in the device characteristics vector, get the
+    // characteristic and save it.
+    updateStatusText("Discovering device capabilities...");
+    for (auto &characteristic : characteristics) {
+        if (aborted) return false;
         vTaskDelay(1);
-
-        ESP_LOGD(TAG, "Checking if client is connected");
-
-        if (!pClient->isConnected()) {
-            ESP_LOGW(TAG,
-                     "Client instance exists but not connected; attempting "
-                     "normal connect");
-            if (!pClient->connect(advDevice)) {
-                updateStatusText("Connection failed, please try again.");
-                ESP_LOGE(TAG, "Failed to connect");
-                connected = false;
-                break;
-            }
-            ESP_LOGD(TAG, "Connect after existence check succeeded");
-        }
-        vTaskDelay(1);
-
-        ESP_LOGI(TAG, "Connected to: %s RSSI: %d",
-                 pClient->getPeerAddress().toString().c_str(),
-                 pClient->getRssi());
-        updateStatusText("Connected! Setting up device...");
-
-        device->pClient = pClient;
-        device->pService = pClient->getService(device->getServiceUUID());
-        if (device->pService == nullptr) {
-            updateStatusText("Device service not found!");
-            ESP_LOGE(TAG, "Service not found");
-            if (stateMachine) {
-                stateMachine->process_event(connected_error_event());
-            }
-            NimBLEDevice::getScan()->start(0);
-            break;
-        }
-
-        // for each characteristic in the device characteristics vector, get the
-        // characteristic and save it.
-        updateStatusText("Discovering device capabilities...");
-        for (auto &characteristic : device->characteristics) {
-            vTaskDelay(1);
-            ESP_LOGD(TAG, "Getting characteristic: %s",
+        characteristic.second.pCharacteristic =
+            pService->getCharacteristic(characteristic.second.uuid);
+        auto *pChr = characteristic.second.pCharacteristic;
+        if (pChr == nullptr) {
+            ESP_LOGD(TAG, "Characteristic %s doesn't exist",
                      characteristic.first.c_str());
-            characteristic.second.pCharacteristic =
-                device->pService->getCharacteristic(characteristic.second.uuid);
-            if (characteristic.second.pCharacteristic == nullptr) {
-                ESP_LOGD(TAG, "Characteristic %s doesn't exist",
-                         characteristic.first.c_str());
-                continue;
-            }
+            continue;
+        }
 
-            if (characteristic.second.notifyCallback) {
-                // if the user has provided a notify callback, subscribe to the
-                // characteristic with the notify callback. RAD BLE replies
-                // are indications, so fall back to those.
-                auto *pChr = characteristic.second.pCharacteristic;
-                if (pChr->canNotify()) {
-                    pChr->subscribe(true, characteristic.second.notifyCallback);
-                } else if (pChr->canIndicate()) {
-                    pChr->subscribe(false,
-                                    characteristic.second.notifyCallback);
-                }
+        if (characteristic.second.notifyCallback) {
+            // The callback stays registered on NimBLE's client after this
+            // device is deleted; the gate turns it into a no-op then. RAD
+            // BLE replies are indications, so fall back to those.
+            auto guarded = NotifyGate::wrap(notifyGate,
+                                            characteristic.second.notifyCallback);
+            if (pChr->canNotify()) {
+                pChr->subscribe(true, guarded);
+            } else if (pChr->canIndicate()) {
+                pChr->subscribe(false, guarded);
             }
         }
-
-        vTaskDelay(1);
-        updateStatusText("Initializing device settings...");
-
-        // run the user defined "on connect" method.
-        device->onConnect();
-        // Now signal the UI/state machine that we're ready
-        if (stateMachine) {
-            stateMachine->process_event(connected_event());
-        }
-
-        ESP_LOGI(TAG, "Done with this device!");
-        updateStatusText("Device ready! Loading interface...");
-        break;
     }
-    vTaskDelete(NULL);
-}
+    if (aborted) return false;
 
-void Device::startConnectionTask() {
-    // The stack stays in internal RAM: device code reads LittleFS on this
-    // task (the Buttplug protocol file), which a PSRAM stack cannot do.
-    if (createInternalTaskWithWait(Device::connectionTask, "connectionTask",
-                                   10 * configMINIMAL_STACK_SIZE, this, 1,
-                                   &connectionTaskHandle, 0,
-                                   4000) != pdPASS) {
-        updateStatusText("Out of memory: cannot connect.");
-        if (stateMachine) {
-            stateMachine->process_event(connected_error_event());
-        }
+    updateStatusText("Initializing device settings...");
+    // run the user defined "on connect" method.
+    onConnect();
+
+    // The peer can drop the link while onConnect() runs (an OSSM reboot);
+    // a device that lost it must not open the control screen.
+    if (aborted || !client->isConnected()) {
+        if (!aborted) updateStatusText("Connection lost, please try again.");
+        return false;
     }
+
+    ESP_LOGI(TAG, "Done with this device!");
+    updateStatusText("Device ready! Loading interface...");
+    return true;
 }
 
 void Device::onConnect(NimBLEClient *pClient) {
@@ -287,8 +350,7 @@ void Device::onConnect(NimBLEClient *pClient) {
 
 void Device::onDisconnect(NimBLEClient *pClient, int reason) {
     playBuzzerPattern(BuzzerPattern::DEVICE_DISCONNECTED);
-    ESP_LOGD(TAG, "Disconnected from %s", getName());
-    NimBLEDevice::getScan()->start(0);
+    ESP_LOGD(TAG, "Disconnected from %s (reason %d)", getName(), reason);
 
     // Defer state machine event to the FreeRTOS timer task to avoid
     // use-after-free: the disconnect action deletes this device, so we

@@ -33,7 +33,13 @@ struct middle_button_long_pressed : public base_event {};
 
 struct done : public base_event {};
 
-struct connected_event : public base_event {};
+class Device;
+
+// Sent by a device's connection task when it is ready. `source` lets the
+// state machine ignore a late event from a device that was destroyed.
+struct connected_event : public base_event {
+    Device *source = nullptr;
+};
 
 struct connected_error_event : public base_event {};
 

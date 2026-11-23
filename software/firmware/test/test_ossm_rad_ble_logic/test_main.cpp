@@ -208,6 +208,122 @@ void test_builtin_text_is_vertically_centred() {
     TEST_ASSERT_EQUAL(211, text_fit::builtinTextTop(200, 30));
 }
 
+// --- Malformed, truncated and oversized replies (indications are cut at the
+// MTU, and anything can arrive on the characteristic) --------------------
+
+void test_ignores_truncated_reply() {
+    const char *full = R"({"v":1,"id":5,"stage":"completed","ok":true,"result":{"state":"menu.idle"}})";
+    Reply reply;
+    for (size_t cut = 0; cut < strlen(full); cut++) {
+        TEST_ASSERT_EQUAL(ReplyKind::Ignore, parseReply(full, cut, 5, reply));
+    }
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal, parseReply(full, strlen(full), 5, reply));
+    TEST_ASSERT_EQUAL_STRING(R"({"state":"menu.idle"})", reply.resultJson.c_str());
+}
+
+void test_parses_unterminated_buffer_by_length() {
+    // BLE data is not NUL-terminated.
+    const char text[] = R"({"v":1,"id":9,"stage":"completed","ok":true})";
+    char buffer[sizeof(text) + 8];
+    memcpy(buffer, text, sizeof(text) - 1);
+    memset(buffer + sizeof(text) - 1, 'x', 9);
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal,
+                      parseReply(buffer, sizeof(text) - 1, 9, reply));
+    TEST_ASSERT_TRUE(reply.ok);
+}
+
+void test_ignores_null_empty_and_zero_id() {
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore, parseReply(nullptr, 10, 1, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore, parseReply("{}", 0, 1, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":0,"stage":"completed","ok":true})", 0, reply));
+}
+
+void test_ignores_ids_of_the_wrong_type() {
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":"5","stage":"completed","ok":true})", 5, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":-5,"stage":"completed","ok":true})", 5, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":5.5,"stage":"completed","ok":true})", 5, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":4294967301,"stage":"completed","ok":true})", 5, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore, parse(R"([5,"completed"])", 5, reply));
+}
+
+void test_ok_must_be_true_and_completed() {
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal,
+                      parse(R"({"v":1,"id":5,"stage":"completed","ok":"true"})", 5, reply));
+    TEST_ASSERT_FALSE(reply.ok);
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal,
+                      parse(R"({"v":1,"id":5,"stage":"failed","ok":true})", 5, reply));
+    TEST_ASSERT_FALSE(reply.ok);
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal,
+                      parse(R"({"v":1,"id":5,"stage":"completed"})", 5, reply));
+    TEST_ASSERT_FALSE(reply.ok);
+    TEST_ASSERT_EQUAL_STRING("failed", reply.code.c_str());
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":5,"stage":"running","ok":true})", 5, reply));
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parse(R"({"v":1,"id":5,"stage":7,"ok":true})", 5, reply));
+}
+
+void test_oversized_reply_keeps_its_result() {
+    std::string big(4000, 'a');
+    const std::string json = R"({"v":1,"id":2,"stage":"completed","ok":true,"result":{"text":")" +
+                             big + R"("}})";
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Terminal, parseReply(json.data(), json.size(), 2, reply));
+    TEST_ASSERT_TRUE(reply.ok);
+    TEST_ASSERT_EQUAL(big.size() + 11, reply.resultJson.size());
+}
+
+void test_deeply_nested_reply_is_ignored() {
+    // ArduinoJson stops at its nesting limit instead of recursing on.
+    std::string json = R"({"v":1,"id":3,"stage":"completed","ok":true,"result":)";
+    for (int i = 0; i < 200; i++) json += "[";
+    for (int i = 0; i < 200; i++) json += "]";
+    json += "}";
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore, parseReply(json.data(), json.size(), 3, reply));
+}
+
+void test_binary_garbage_is_ignored() {
+    const unsigned char garbage[] = {0x7b, 0x00, 0xff, 0xfe, 0x22, 0x69, 0x64,
+                                     0x22, 0x3a, 0x35, 0x7d, 0x80, 0x81};
+    Reply reply;
+    TEST_ASSERT_EQUAL(ReplyKind::Ignore,
+                      parseReply(reinterpret_cast<const char *>(garbage),
+                                 sizeof(garbage), 5, reply));
+}
+
+void test_lease_and_setting_reads_reject_wrong_types() {
+    uint32_t lease = 77;
+    TEST_ASSERT_FALSE(parseLease(R"({"lease":0})", lease));
+    TEST_ASSERT_FALSE(parseLease(R"({"lease":"12"})", lease));
+    TEST_ASSERT_FALSE(parseLease(R"({"lease":-3})", lease));
+    TEST_ASSERT_FALSE(parseLease(R"({"lease":4294967296})", lease));
+    TEST_ASSERT_FALSE(parseLease(R"({"lease":12)", lease));
+    TEST_ASSERT_FALSE(parseLease("", lease));
+    SettingRead read;
+    TEST_ASSERT_FALSE(parseSettingRead(R"({"value":"300"})", read));
+    TEST_ASSERT_FALSE(parseSettingRead(R"({"active":3})", read));
+    TEST_ASSERT_FALSE(parseSettingRead(R"({"value":)", read));
+}
+
+void test_request_escapes_hostile_paths() {
+    const std::string request =
+        buildRequest(11, "setting.read", "a\"b\\c\n", "", 0);
+    JsonDocument parsed;
+    TEST_ASSERT_TRUE(deserializeJson(parsed, request) == DeserializationError::Ok);
+    TEST_ASSERT_EQUAL_STRING("a\"b\\c\n", parsed["path"].as<const char *>());
+    TEST_ASSERT_EQUAL(11, parsed["id"].as<int>());
+}
+
 }  // namespace
 
 int main(int, char **) {
@@ -233,5 +349,15 @@ int main(int, char **) {
     RUN_TEST(test_pause_first_falls_back_to_builtin_font);
     RUN_TEST(test_short_labels_keep_button_font);
     RUN_TEST(test_builtin_text_is_vertically_centred);
+    RUN_TEST(test_ignores_truncated_reply);
+    RUN_TEST(test_parses_unterminated_buffer_by_length);
+    RUN_TEST(test_ignores_null_empty_and_zero_id);
+    RUN_TEST(test_ignores_ids_of_the_wrong_type);
+    RUN_TEST(test_ok_must_be_true_and_completed);
+    RUN_TEST(test_oversized_reply_keeps_its_result);
+    RUN_TEST(test_deeply_nested_reply_is_ignored);
+    RUN_TEST(test_binary_garbage_is_ignored);
+    RUN_TEST(test_lease_and_setting_reads_reject_wrong_types);
+    RUN_TEST(test_request_escapes_hostile_paths);
     return UNITY_END();
 }
