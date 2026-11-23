@@ -20,6 +20,9 @@ void stopControllerTask()
 {
     if (controllerTaskHandle == nullptr) return;
     controllerExitRequested = true;
+    // Called from the controller task itself: it exits at the top of its
+    // loop. Waiting here would wait on ourselves.
+    if (xTaskGetCurrentTaskHandle() == controllerTaskHandle) return;
     const TickType_t waitStart = xTaskGetTickCount();
     while (controllerTaskHandle != nullptr &&
            (xTaskGetTickCount() - waitStart) < pdMS_TO_TICKS(300)) {

@@ -5,6 +5,8 @@
 #include <esp_log.h>
 
 #include "devices/device.h"
+#include "pages/controller.h"
+#include "pages/menus.h"
 #include "services/leftEncoderMonitor.h"
 #include "services/rad_ble.h"
 
@@ -27,6 +29,9 @@ BleShutdownResult shutdownBleForNetwork() {
         if (device->needsPersistentLeftEncoderMonitoring()) {
             stopLeftEncoderMonitoring();
         }
+        // No UI task may still be drawing the device when it is deleted.
+        stopMenuTask();
+        stopControllerTask();
         delete device;  // disconnects and clears the client callbacks
         device = nullptr;
     }
