@@ -107,6 +107,32 @@ Reply OssmRadBle::request(const char *op, const char *path,
     return reply;
 }
 
+void OssmRadBle::setWantedMode(const char *mode) {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    wanted = mode != nullptr ? mode : "";
+    xSemaphoreGive(stateMutex);
+}
+
+std::string OssmRadBle::wantedMode() {
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    std::string mode = wanted;
+    xSemaphoreGive(stateMutex);
+    return mode;
+}
+
+bool OssmRadBle::sendCommand(const std::string &text) {
+    if (detached || commandCharacteristic == nullptr) return false;
+    ESP_LOGI(RAD_TAG, "Command %s", text.c_str());
+    return commandCharacteristic->writeValue(text);
+}
+
+bool OssmRadBle::tryStartFollow() {
+    bool expected = false;
+    return following.compare_exchange_strong(expected, true);
+}
+
+void OssmRadBle::endFollow() { following = false; }
+
 bool OssmRadBle::readSetting(const char *path, ossm_rad_ble::SettingRead &out,
                              Reply &failure) {
     const Reply reply = request("setting.read", path);
