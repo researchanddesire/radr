@@ -32,7 +32,8 @@ class OssmRadBle {
     // firmware without RAD BLE replies.
     void attach(NimBLERemoteCharacteristic *command,
                 NimBLERemoteCharacteristic *response);
-    // Called when the device is deleted; later requests fail fast.
+    // Called when the device is destroyed (before NimBLE can free the
+    // characteristics); later requests fail fast and attach() is ignored.
     void detach();
 
     bool isAvailable() const;

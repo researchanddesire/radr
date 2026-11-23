@@ -121,6 +121,11 @@ class Device : public NimBLEClientCallbacks {
     // still be up and no connection task runs: stop outputs here.
     virtual void onTeardown() {}
 
+    // Called by destroy() every time, before the link is dropped, possibly
+    // while the connection task still runs: cut helpers that other tasks
+    // hold (they outlive the device) off the BLE client. Must not block.
+    virtual void onDestroy() {}
+
     // True once destroy() was called; connection steps stop early.
     bool connectionAborted() const { return aborted; }
 

@@ -102,6 +102,7 @@ void Device::destroy(Device *target) {
     if (running) target->deleteWhenConnectionEnds = true;
     portEXIT_CRITICAL(&lifecycleLock);
 
+    target->onDestroy();
     if (!running) target->onTeardown();
     // Stop the link: a connection task blocked in a BLE read or in connect()
     // returns as soon as it is gone.
