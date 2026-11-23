@@ -283,46 +283,60 @@ class OSSM : public Device {
 
         // finally, we set inital preferences and go to the active mode
         send("speedKnobLimit", "false");
+
+        auto command = characteristics.find("command");
+        auto response = characteristics.find("response");
+        NimBLERemoteCharacteristic *responseCharacteristic =
+            response != characteristics.end() ? response->second.pCharacteristic
+                                              : nullptr;
+        if (responseCharacteristic != nullptr) {
+            // RAD BLE replies are indications, which cannot exceed the MTU.
+            // A new client connects without exchanging it (see device.cpp).
+            if (pClient != nullptr && pClient->getMTU() < 247) {
+                pClient->exchangeMTU();
+            }
+            radBle->attach(command != characteristics.end()
+                               ? command->second.pCharacteristic
+                               : nullptr,
+                           responseCharacteristic);
+        }
+
         // A mode request is a button press on the OSSM. On its error page the
         // first press opens help and the second restarts the OSSM, which then
-        // homes again and drops this connection. Leave the error on screen.
-        const std::string stateJson = readString("state");
-        OssmStateInfo current;
-        const bool ossmShowsError =
-            parseOssmState(stateJson.c_str(), stateJson.size(), current) &&
-            ossm_mode_follow::startsWith(current.state, "error");
-        if (ossmShowsError) {
-            ESP_LOGW(TAG, "OSSM shows %s; not requesting a mode",
-                     current.state.c_str());
-        } else if (operationMode == OssmMode::SimplePenetration) {
-            send("command", "go:simplePenetration");
-        } else {
-            send("command", "go:strokeEngine");
-            vTaskDelay(pdMS_TO_TICKS(250));
-            // TODO: A bug on AJ's dev unit requires two "go:strokeEngine"
-            // commands.
-            send("command", "go:strokeEngine");
+        // homes again and drops this connection. So the RADR presses only
+        // when it knows what the OSSM shows: a state it cannot read is
+        // treated like an error page (on the Test Rig an unreadable state
+        // let two presses restart an OSSM on its error page).
+        const char *wanted = operationMode == OssmMode::SimplePenetration
+                                 ? "simplePenetration"
+                                 : "strokeEngine";
+        std::string ossmState;
+        const bool stateKnown = readOssmState(ossmState);
+        switch (ossm_mode_follow::connectAction(stateKnown, ossmState, wanted,
+                                                radBle->isAvailable())) {
+            case ossm_mode_follow::ConnectAction::None:
+                ESP_LOGW(TAG, "OSSM shows %s; not requesting %s now",
+                         stateKnown ? ossmState.c_str() : "an unknown state",
+                         wanted);
+                break;
+            case ossm_mode_follow::ConnectAction::PressOnce:
+                send("command", ossm_command::go(wanted));
+                break;
+            case ossm_mode_follow::ConnectAction::PressTwice:
+                send("command", ossm_command::go(wanted));
+                vTaskDelay(pdMS_TO_TICKS(250));
+                // TODO: A bug on AJ's dev unit requires two "go:strokeEngine"
+                // commands. Only for OSSM firmware without RAD BLE replies,
+                // where no follower can ask again.
+                send("command", ossm_command::go(wanted));
+                break;
         }
         vTaskDelay(pdMS_TO_TICKS(250));
 
-        // RAD BLE replies are indications, which cannot exceed the MTU. A
-        // new client connects without exchanging it (see device.cpp).
-        if (pClient != nullptr && pClient->getMTU() < 247) {
-            pClient->exchangeMTU();
-        }
-        auto command = characteristics.find("command");
-        auto response = characteristics.find("response");
-        radBle->attach(command != characteristics.end()
-                           ? command->second.pCharacteristic
-                           : nullptr,
-                       response != characteristics.end()
-                           ? response->second.pCharacteristic
-                           : nullptr);
         // The request above is lost if the OSSM is homing, and starts a home
-        // that ends in the OSSM menu if it is not homed yet.
-        followWantedMode(operationMode == OssmMode::SimplePenetration
-                             ? "simplePenetration"
-                             : "strokeEngine");
+        // that ends in the OSSM menu if it is not homed yet; the follower asks
+        // again once the OSSM is back in its menu.
+        followWantedMode(wanted);
 
         isConnected = true;
         isFirstConnect = false;
@@ -669,6 +683,34 @@ class OSSM : public Device {
     const char *getLeftEncoderParameterName() const override { return "Speed"; }
 
   private:
+    // The OSSM's state name ("menu.idle", "error.idle", ...). Uses a RAD BLE
+    // state.read when the OSSM answers those: a short indication that
+    // arrives whole. The legacy state characteristic needs a long read,
+    // which the OSSM can rebuild between its parts (mixed or cut-short JSON,
+    // seen on the Test Rig as "JSON parse failed"). Tries three times; false
+    // when the state stays unknown.
+    bool readOssmState(std::string &state) {
+        for (int attempt = 0; attempt < 3 && !connectionAborted(); attempt++) {
+            if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(400));
+            if (radBle->isAvailable()) {
+                const ossm_rad_ble::Reply reply =
+                    radBle->request("state.read", nullptr);
+                if (reply.ok &&
+                    ossm_mode_follow::parseStateName(reply.resultJson, state))
+                    return true;
+                continue;
+            }
+            const std::string json = readString("state");
+            OssmStateInfo info;
+            if (parseOssmState(json.c_str(), json.size(), info) &&
+                !info.state.empty()) {
+                state = info.state;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Records `mode` as the one the RADR wants and, unless one is running,
     // starts a follower that asks for it again once the OSSM stops homing
     // (ossm_mode_follow_logic.h). The follower only holds the shared RAD BLE
