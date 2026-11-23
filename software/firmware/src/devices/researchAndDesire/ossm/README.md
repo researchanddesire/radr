@@ -107,7 +107,23 @@ go:menu                  # Return to main menu
 2. Connect and discover service
 3. Subscribe to state notifications
 4. Read initial state and patterns
-5. Send commands as needed
+5. Request the control mode (`go:strokeEngine` or `go:simplePenetration`),
+   unless the OSSM shows an error page: there a press opens help and the next
+   one restarts the OSSM
+6. Send commands as needed
+
+### Modes and homing
+
+The OSSM ignores mode requests while it homes, and a request that finds it
+unhomed starts a home. Either way the home ends in the OSSM menu; the OSSM
+never enters a mode on its own afterwards. So every mode request also records
+the wanted mode on the RAD BLE client and starts a follower task
+(`ossm_mode_follow_logic.h`, native test `test/test_ossm_mode_follow`). It
+polls `state.read` while the OSSM homes, asks for the mode again when homing
+ends (at most 3 times), and stops on an error page, on a menu, restart,
+update or pairing request, on disconnect, or after 150 s. It holds only the
+shared RAD BLE client, never the device, and does nothing on OSSM firmware
+without RAD BLE replies.
 
 ## RAD BLE Requests (Machine Settings)
 
