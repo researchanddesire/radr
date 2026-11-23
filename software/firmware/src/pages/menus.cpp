@@ -405,6 +405,9 @@ void stopMenuTask() {
     // If an existing task is running, request cooperative exit and wait
     if (menuTaskHandle != NULL) {
         menuTaskExitRequested = true;
+        // Called from the menu task itself: it exits on its own. Waiting
+        // here would wait on ourselves.
+        if (xTaskGetCurrentTaskHandle() == menuTaskHandle) return;
         const TickType_t waitStart = xTaskGetTickCount();
         const TickType_t waitTimeout = pdMS_TO_TICKS(100);
         while (menuTaskHandle != NULL &&

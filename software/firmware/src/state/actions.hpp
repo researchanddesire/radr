@@ -84,6 +84,12 @@ namespace actions {
         }
 
         if (device != nullptr) {
+            // The controller and menu tasks run on the other core and draw
+            // the device's display objects and menu. Deleting the device
+            // under them was a use-after-free that rebooted the RADR when the
+            // OSSM went away while the control screen was open.
+            stopMenuTask();
+            stopControllerTask();
             delete device;  // Properly calls destructor AND frees memory
             device = nullptr;
         }
