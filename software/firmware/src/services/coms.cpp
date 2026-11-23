@@ -66,8 +66,10 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         // get all service UUIDs
         const DeviceFactory *factory = nullptr;
         auto countOfServiceUUIDs = advertisedDevice->getServiceUUIDCount();
+        // No yield in here: this runs on the BLE host task with a pointer
+        // into NimBLE's scan results, and the less time it holds it the
+        // better.
         for (int i = 0; i < countOfServiceUUIDs; i++) {
-            vTaskDelay(1);
             auto serviceUUID = advertisedDevice->getServiceUUID(i);
 
             auto name = advertisedDevice->getName();
@@ -193,12 +195,11 @@ void initBLE() {
 
     /** Set the callbacks to call when scan events occur, no duplicates */
     pScan->setScanCallbacks(&scanCallbacks, false);
-    // Keep no scan results in NimBLE: the callback copies the few supported
-    // devices into discoveredDevices. Stored results were one small
-    // internal-RAM block per advertiser in range (dozens in a busy room),
-    // freed and re-allocated on every scan, which fragmented the internal
-    // heap the BLE connection and OTA tasks need.
-    pScan->setMaxResults(0);
+    // NimBLE keeps its default result storage. With setMaxResults(0) its
+    // stop() frees every stored advertisement on the calling task, and
+    // stop() runs on several tasks while the BLE host task may still be in
+    // onResult with one of them. The results are freed when the next scan
+    // starts (no scan running then); the device list holds its own copies.
 
     /** Set scan interval (how often) and window (how long) in milliseconds */
     pScan->setInterval(100);

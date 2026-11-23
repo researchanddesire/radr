@@ -93,6 +93,11 @@ class OSSM : public Device {
         };
     }
 
+    // The mode follower and the settings tasks keep the RAD BLE client
+    // after this device is gone; NimBLE may free its characteristics (BLE
+    // shutdown for updates) before the delayed delete runs.
+    void onDestroy() override { radBle->detach(); }
+
     ~OSSM() override { radBle->detach(); }
 
     const char *getName() override { return "OSSM"; }

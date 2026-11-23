@@ -38,6 +38,26 @@ LedState ledState;
 // ease in out sine
 double ease(const double t) { return 0.5 * (1 + sin(3.1415926 * (t - 0.5))); }
 
+// FastLED's RMT driver (FastLED 3.10 on IDF 5) aborts the firmware through
+// ESP_ERROR_CHECK when two tasks call show() at once ("rmt_tx_enable:
+// channel not in init state"). The LED task animates while UI tasks (the
+// encoder dials of the control screen) set single LEDs, so on the Test Rig
+// the RADR rebooted when the control screen opened during the "connected"
+// fade. Every write to leds[] and every show() holds this lock.
+static SemaphoreHandle_t ledsLock() {
+    static SemaphoreHandle_t lock = xSemaphoreCreateMutex();
+    return lock;
+}
+
+namespace {
+struct LedsGuard {
+    LedsGuard() { xSemaphoreTake(ledsLock(), portMAX_DELAY); }
+    ~LedsGuard() { xSemaphoreGive(ledsLock()); }
+    LedsGuard(const LedsGuard &) = delete;
+    LedsGuard &operator=(const LedsGuard &) = delete;
+};
+}  // namespace
+
 void ledsTask(void* pvParameters) {
     auto* state = static_cast<LedState*>(pvParameters);
     bool shouldDraw = true;
@@ -82,19 +102,22 @@ void ledsTask(void* pvParameters) {
             state->startColor = state->targetColor.value_or(0);
         }
 
-        leds[0] = individualLedStates[0].isIndividuallyControlled
-                      ? individualLedStates[0].color
-                      : CHSV(state->currentColor.value_or(0), 255,
-                             state->currentBrightness);
-        leds[1] = individualLedStates[1].isIndividuallyControlled
-                      ? individualLedStates[1].color
-                      : CHSV(state->currentColor.value_or(0), 255,
-                             state->currentBrightness);
-        leds[2] = individualLedStates[2].isIndividuallyControlled
-                      ? individualLedStates[2].color
-                      : CHSV(state->currentColor.value_or(0), 255,
-                             state->currentBrightness);
-        FastLED.show();
+        {
+            LedsGuard guard;
+            leds[0] = individualLedStates[0].isIndividuallyControlled
+                          ? individualLedStates[0].color
+                          : CHSV(state->currentColor.value_or(0), 255,
+                                 state->currentBrightness);
+            leds[1] = individualLedStates[1].isIndividuallyControlled
+                          ? individualLedStates[1].color
+                          : CHSV(state->currentColor.value_or(0), 255,
+                                 state->currentBrightness);
+            leds[2] = individualLedStates[2].isIndividuallyControlled
+                          ? individualLedStates[2].color
+                          : CHSV(state->currentColor.value_or(0), 255,
+                                 state->currentBrightness);
+            FastLED.show();
+        }
 
         vTaskDelay(1);
     }
@@ -102,11 +125,14 @@ void ledsTask(void* pvParameters) {
 
 void initFastLEDs() {
     ESP_LOGI(TAG, "Initializing FastLEDs...");
-    CFastLED::addLeds<LED_TYPE, pins::LED_PIN, COLOR_ORDER>(leds,
-                                                            pins::NUM_LEDS)
-        .setCorrection(TypicalLEDStrip);
-    FastLED.setBrightness(BRIGHTNESS);
-    FastLED.show();
+    {
+        LedsGuard guard;
+        CFastLED::addLeds<LED_TYPE, pins::LED_PIN, COLOR_ORDER>(leds,
+                                                                pins::NUM_LEDS)
+            .setCorrection(TypicalLEDStrip);
+        FastLED.setBrightness(BRIGHTNESS);
+        FastLED.show();
+    }
 
 #ifdef DEBUG_LEDS
     ESP_LOGI(TAG, "DEBUG_LEDS is defined, setting leds to red and green");
@@ -187,6 +213,7 @@ void setIndividualLed(uint8_t ledIndex, uint16_t rgb565Color,
     individualLedStates[ledIndex].isIndividuallyControlled = true;
 
     // Update the LED immediately
+    LedsGuard guard;
     leds[ledIndex] = individualLedStates[ledIndex].color;
     FastLED.show();
 }
