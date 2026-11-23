@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
@@ -54,6 +55,20 @@ class OssmRadBle {
         const std::vector<std::pair<const char *, float>> &writes,
         ossm_rad_ble::Reply &failure);
 
+    // Mode the RADR last asked the OSSM for ("strokeEngine",
+    // "simplePenetration", "streaming"; empty after a menu, restart, update
+    // or pairing request). Read by the mode follower (ossm_mode_follow_logic.h).
+    void setWantedMode(const char *mode);
+    std::string wantedMode();
+
+    // Writes a legacy text command ("go:strokeEngine") to the command
+    // characteristic. False once the device is deleted.
+    bool sendCommand(const std::string &text);
+
+    // At most one mode follower runs per connection.
+    bool tryStartFollow();
+    void endFollow();
+
   private:
     SemaphoreHandle_t requestMutex = nullptr;
     SemaphoreHandle_t replySemaphore = nullptr;
@@ -66,4 +81,7 @@ class OssmRadBle {
     uint32_t nextId = 0;
     uint32_t pendingId = 0;
     ossm_rad_ble::Reply pendingReply;
+
+    std::string wanted;               // guarded by stateMutex
+    std::atomic<bool> following{false};
 };

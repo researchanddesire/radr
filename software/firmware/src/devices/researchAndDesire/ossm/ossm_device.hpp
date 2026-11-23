@@ -15,9 +15,11 @@
 #include <structs/SettingPercents.h>
 
 #include "../../device.h"
+#include "ossm_mode_follow_logic.h"
 #include "ossm_rad_ble.h"
 #include "ossm_state.h"
 #include "state/remote.h"
+#include "utils/psramTask.h"
 
 #define OSSM_CHARACTERISTIC_UUID_COMMAND "522B443A-4F53-534D-1000-420BADBABE69"
 // RAD BLE replies to JSON written to the command characteristic (indicate)
@@ -271,7 +273,18 @@ class OSSM : public Device {
 
         // finally, we set inital preferences and go to the active mode
         send("speedKnobLimit", "false");
-        if (operationMode == OssmMode::SimplePenetration) {
+        // A mode request is a button press on the OSSM. On its error page the
+        // first press opens help and the second restarts the OSSM, which then
+        // homes again and drops this connection. Leave the error on screen.
+        const std::string stateJson = readString("state");
+        OssmStateInfo current;
+        const bool ossmShowsError =
+            parseOssmState(stateJson.c_str(), stateJson.size(), current) &&
+            ossm_mode_follow::startsWith(current.state, "error");
+        if (ossmShowsError) {
+            ESP_LOGW(TAG, "OSSM shows %s; not requesting a mode",
+                     current.state.c_str());
+        } else if (operationMode == OssmMode::SimplePenetration) {
             send("command", "go:simplePenetration");
         } else {
             send("command", "go:strokeEngine");
@@ -295,6 +308,11 @@ class OSSM : public Device {
                        response != characteristics.end()
                            ? response->second.pCharacteristic
                            : nullptr);
+        // The request above is lost if the OSSM is homing, and starts a home
+        // that ends in the OSSM menu if it is not homed yet.
+        followWantedMode(operationMode == OssmMode::SimplePenetration
+                             ? "simplePenetration"
+                             : "strokeEngine");
 
         isConnected = true;
         isFirstConnect = false;
@@ -361,6 +379,7 @@ class OSSM : public Device {
     }
 
     void onExit() override {
+        radBle->setWantedMode(nullptr);
         // This forces the OSSM to go the menu screen.
         // this loop will not return until the device is diconnected or the menu
         // screen is reached.
@@ -381,13 +400,25 @@ class OSSM : public Device {
         }
     }
 
-    void onMenuOpen() override { send("command", "go:menu"); }
+    void onMenuOpen() override {
+        radBle->setWantedMode(nullptr);
+        send("command", "go:menu");
+    }
 
-    void onRestart() override { send("command", "go:restart"); }
+    void onRestart() override {
+        radBle->setWantedMode(nullptr);
+        send("command", "go:restart");
+    }
 
-    void onUpdate() override { send("command", "go:update"); }
+    void onUpdate() override {
+        radBle->setWantedMode(nullptr);
+        send("command", "go:update");
+    }
 
-    void onPairing() override { send("command", "go:pairing"); }
+    void onPairing() override {
+        radBle->setWantedMode(nullptr);
+        send("command", "go:pairing");
+    }
 
     // Full state JSON via a long read (notifications are MTU-truncated).
     std::string readRawState() override { return readString("state"); }
@@ -395,14 +426,19 @@ class OSSM : public Device {
     void enterStrokeEngineMode() override {
         operationMode = OssmMode::StrokeEngine;
         send("command", "go:strokeEngine");
+        followWantedMode("strokeEngine");
     }
 
     void enterSimplePenetrationMode() override {
         operationMode = OssmMode::SimplePenetration;
         send("command", "go:simplePenetration");
+        followWantedMode("simplePenetration");
     }
 
-    void enterStreamingMode() override { send("command", "go:streaming"); }
+    void enterStreamingMode() override {
+        send("command", "go:streaming");
+        followWantedMode("streaming");
+    }
 
     bool isInSimplePenetrationMode() const override {
         return operationMode == OssmMode::SimplePenetration;
@@ -626,6 +662,76 @@ class OSSM : public Device {
     const char *getLeftEncoderParameterName() const override { return "Speed"; }
 
   private:
+    // Records `mode` as the one the RADR wants and, unless one is running,
+    // starts a follower that asks for it again once the OSSM stops homing
+    // (ossm_mode_follow_logic.h). The follower only holds the shared RAD BLE
+    // client, so it outlives this device safely; it needs OSSM firmware with
+    // RAD BLE replies and does nothing on older firmware.
+    void followWantedMode(const char *mode) {
+        radBle->setWantedMode(mode);
+        if (!radBle->isAvailable() || !radBle->tryStartFollow()) return;
+        auto *holder = new std::shared_ptr<OssmRadBle>(radBle);
+        if (createPsramTask(modeFollowTask, "ossmModeFollow",
+                            4 * configMINIMAL_STACK_SIZE, holder, 1, nullptr,
+                            1) != pdPASS) {
+            radBle->endFollow();
+            delete holder;
+        }
+    }
+
+    static void modeFollowTask(void *param) {
+        using ossm_mode_follow::Step;
+        auto *holder = static_cast<std::shared_ptr<OssmRadBle> *>(param);
+        std::shared_ptr<OssmRadBle> client = *holder;
+        delete holder;
+
+        // Let the request that started this follower and the rest of the
+        // connection setup finish first.
+        vTaskDelay(pdMS_TO_TICKS(ossm_mode_follow::kStartDelayMs));
+        const uint32_t started = millis();
+        std::string mode;
+        int requests = 0;
+        int failedReads = 0;
+        bool waitedForHoming = false;
+        while (client->isAvailable() &&
+               millis() - started < ossm_mode_follow::kFollowMs) {
+            const std::string wanted = client->wantedMode();
+            if (wanted != mode) {
+                mode = wanted;
+                requests = 0;
+            }
+            const ossm_rad_ble::Reply reply = client->request("state.read", nullptr);
+            std::string state;
+            if (!reply.ok ||
+                !ossm_mode_follow::parseStateName(reply.resultJson, state)) {
+                if (++failedReads >= 5) break;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            failedReads = 0;
+            const Step step = ossm_mode_follow::next(state, mode, requests);
+            if (step == Step::Ready || step == Step::GiveUp) {
+                if (waitedForHoming || requests > 0)
+                    ESP_LOGI("OSSM_FOLLOW", "OSSM %s (wanted %s, %d requests)",
+                             state.c_str(), mode.empty() ? "none" : mode.c_str(),
+                             requests);
+                break;
+            }
+            if (step == Step::WaitForHoming) {
+                waitedForHoming = true;
+                vTaskDelay(pdMS_TO_TICKS(ossm_mode_follow::kHomingPollMs));
+                continue;
+            }
+            ESP_LOGI("OSSM_FOLLOW", "OSSM %s: asking for %s again", state.c_str(),
+                     mode.c_str());
+            if (!client->sendCommand("go:" + mode)) break;
+            ++requests;
+            vTaskDelay(pdMS_TO_TICKS(ossm_mode_follow::kRequestSettleMs));
+        }
+        client->endFollow();
+        exitPsramTask();
+    }
+
     void shareWiFiCredentials() {
         if (WiFi.status() != WL_CONNECTED) return;
 
