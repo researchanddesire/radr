@@ -51,7 +51,7 @@ class LovenseDevice : public Device, public ButtplugIoProtocol {
                  }}}};
     }
 
-    ~LovenseDevice() override {
+    void onTeardown() override {
         // RADR is about to drop the link (the user left the device or
         // disconnected it). Nothing guarantees that the toy stops by itself,
         // so stop it first and give the write time to leave the radio.

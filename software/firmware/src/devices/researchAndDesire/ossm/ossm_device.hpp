@@ -15,6 +15,7 @@
 #include <structs/SettingPercents.h>
 
 #include "../../device.h"
+#include "ossm_command_logic.h"
 #include "ossm_mode_follow_logic.h"
 #include "ossm_rad_ble.h"
 #include "ossm_state.h"
@@ -95,6 +96,10 @@ class OSSM : public Device {
     ~OSSM() override { radBle->detach(); }
 
     const char *getName() override { return "OSSM"; }
+
+    // onConnect() only talks BLE (state, patterns, pairing, Wi-Fi config
+    // from RAM), so the connection task can use a PSRAM stack.
+    bool connectsWithoutFlash() const override { return true; }
     NimBLEUUID getServiceUUID() override { return NimBLEUUID(OSSM_SERVICE_ID); }
 
     void drawControls() override {
@@ -529,9 +534,8 @@ class OSSM : public Device {
         }
         settings.speed = speed;
         updateMenuButtonState();
-        speed = constrain(speed, 0, 100);
         return send("command",
-                    std::string("set:speed:") + std::to_string(speed));
+                    ossm_command::set(ossm_command::Setting::Speed, speed));
     }
 
     float getDepth() { return constrain(settings.depth, 0.0f, 100.0f); }
@@ -543,9 +547,8 @@ class OSSM : public Device {
             return true;
         }
         settings.depth = depth;
-        depth = constrain(depth, 0, 100);
         return send("command",
-                    std::string("set:depth:") + std::to_string(depth));
+                    ossm_command::set(ossm_command::Setting::Depth, depth));
     }
 
     float getStroke() { return constrain(settings.stroke, 0.0f, 100.0f); }
@@ -557,9 +560,8 @@ class OSSM : public Device {
             return true;
         }
         settings.stroke = stroke;
-        stroke = constrain(stroke, 0, 100);
         return send("command",
-                    std::string("set:stroke:") + std::to_string(stroke));
+                    ossm_command::set(ossm_command::Setting::Stroke, stroke));
     }
 
     bool setSensation(int sensation) {
@@ -569,9 +571,8 @@ class OSSM : public Device {
             return true;
         }
         settings.sensation = sensation;
-        sensation = constrain(sensation, 0, 100);
         return send("command",
-                    std::string("set:sensation:") + std::to_string(sensation));
+                    ossm_command::set(ossm_command::Setting::Sensation, sensation));
     }
 
     bool setPattern(int pattern) {
@@ -580,6 +581,7 @@ class OSSM : public Device {
             patternName = EMPTY_STRING;
             return false;
         }
+        if (pattern < 0) return false;  // a negative index would read before menu[0]
         if (pattern == static_cast<int>(settings.pattern)) {
             return true;
         }
@@ -593,8 +595,8 @@ class OSSM : public Device {
             patternNameDisplay->setColor(Colors::textForeground);
         }
 
-        return send("command",
-                    std::string("set:pattern:") + std::to_string(patternIdx));
+        return send("command", ossm_command::set(ossm_command::Setting::Pattern,
+                                                 patternIdx));
     }
 
     void syncRightEncoder() {
@@ -679,9 +681,16 @@ class OSSM : public Device {
         }
     }
 
+    // exitPsramTask() never returns, so nothing may still be in scope
+    // there: a shared_ptr left on the task's stack is never released and
+    // leaked one OssmRadBle (about 600 B of internal RAM) per connection.
     static void modeFollowTask(void *param) {
+        followUntilDone(static_cast<std::shared_ptr<OssmRadBle> *>(param));
+        exitPsramTask();
+    }
+
+    static void followUntilDone(std::shared_ptr<OssmRadBle> *holder) {
         using ossm_mode_follow::Step;
-        auto *holder = static_cast<std::shared_ptr<OssmRadBle> *>(param);
         std::shared_ptr<OssmRadBle> client = *holder;
         delete holder;
 
@@ -724,12 +733,12 @@ class OSSM : public Device {
             }
             ESP_LOGI("OSSM_FOLLOW", "OSSM %s: asking for %s again", state.c_str(),
                      mode.c_str());
-            if (!client->sendCommand("go:" + mode)) break;
+            const std::string command = ossm_command::go(mode);
+            if (command.empty() || !client->sendCommand(command)) break;
             ++requests;
             vTaskDelay(pdMS_TO_TICKS(ossm_mode_follow::kRequestSettleMs));
         }
         client->endFollow();
-        exitPsramTask();
     }
 
     void shareWiFiCredentials() {

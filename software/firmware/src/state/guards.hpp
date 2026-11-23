@@ -97,6 +97,13 @@ const auto isConnected = []() -> bool {
     return device != nullptr && device->isConnected;
 };
 
+// A connected_event belongs to the current, connected device. One from a
+// connection task whose device was destroyed meanwhile is stale.
+const auto isCurrentConnection = [](const connected_event &event) -> bool {
+    return device != nullptr && device->isConnected &&
+           (event.source == nullptr || event.source == device);
+};
+
 const auto isSimplePenetrationMode = []() -> bool {
     return device != nullptr && device->isInSimplePenetrationMode();
 };

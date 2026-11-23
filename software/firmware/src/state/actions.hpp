@@ -36,7 +36,7 @@
 
 // Forward declarations to avoid circular dependencies
 struct DiscoveredDevice;
-std::vector<DiscoveredDevice> &getDiscoveredDevices();
+std::vector<DiscoveredDevice> getDiscoveredDevices();
 void clearDiscoveredDevices();
 void connectToDiscoveredDevice(int index);
 bool startScanWithTimeout(int timeoutMs, void (*onComplete)());
@@ -45,6 +45,7 @@ void onScanComplete();
 // Defined in remote.cpp — breaks circular dependency with stateMachine type
 void fireStateMachineDoneEvent();
 void fireStateMachineTaskFailedEvent();
+void fireStateMachineConnectedErrorEvent();
 
 namespace actions {
 
@@ -90,8 +91,11 @@ namespace actions {
             // OSSM went away while the control screen was open.
             stopMenuTask();
             stopControllerTask();
-            delete device;  // Properly calls destructor AND frees memory
+            // The connection task may still be using it; destroy() leaves
+            // the delete to that task then.
+            Device *leaving = device;
             device = nullptr;
+            Device::destroy(leaving);
         }
 
         // and then stop scanning.

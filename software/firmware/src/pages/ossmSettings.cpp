@@ -310,8 +310,10 @@ namespace ossmSettings {
             return new std::shared_ptr<OssmRadBle>(ossm->radBle);
         }
 
-        void loadTask(void *param) {
-            auto *holder = static_cast<std::shared_ptr<OssmRadBle> *>(param);
+        // vTaskDelete(nullptr) never returns: the task functions below run
+        // their work in a function first, so its shared_ptr and strings are
+        // released before the task deletes itself.
+        void load(std::shared_ptr<OssmRadBle> *holder) {
             std::shared_ptr<OssmRadBle> client = *holder;
             delete holder;
 
@@ -348,6 +350,10 @@ namespace ossmSettings {
             ESP_LOGI(SETTINGS_TAG, "Load finished: %d %s",
                      static_cast<int>(result), error.c_str());
             loadStatus = result;
+        }
+
+        void loadTask(void *param) {
+            load(static_cast<std::shared_ptr<OssmRadBle> *>(param));
             fireStateMachineDoneEvent();
             vTaskDelete(nullptr);
         }
@@ -368,8 +374,7 @@ namespace ossmSettings {
             }
         }
 
-        void saveTask(void *param) {
-            auto *holder = static_cast<std::shared_ptr<OssmRadBle> *>(param);
+        void save(std::shared_ptr<OssmRadBle> *holder) {
             std::shared_ptr<OssmRadBle> client = *holder;
             delete holder;
 
@@ -404,6 +409,10 @@ namespace ossmSettings {
                 }
                 saveOk = false;
             }
+        }
+
+        void saveTask(void *param) {
+            save(static_cast<std::shared_ptr<OssmRadBle> *>(param));
             fireStateMachineDoneEvent();
             vTaskDelete(nullptr);
         }
