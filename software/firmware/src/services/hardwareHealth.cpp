@@ -10,9 +10,10 @@
 #include <esp_timer.h>
 
 #include "hardwareHealthFormat.h"
-#include "state/remote.h"
 
-using namespace sml;
+// From state/remote.cpp. Including state/remote.h here would copy its
+// headers' string and bitmap tables into internal RAM a second time.
+bool isAtIdleScreen();
 
 #ifndef FIRMWARE_BUILD_SHA
 #define FIRMWARE_BUILD_SHA "unknown"
@@ -73,11 +74,7 @@ void hardwareHealthMenuProgress() {
 
 void hardwareHealthHeartbeat() {
     if (!hardwareHealth::heartbeatDue(millis(), lastHeartbeatMs)) return;
-    // After boot the RADR rests on the device list; the main menu is the
-    // other idle screen. Both draw loops report progress.
-    const bool atIdleScreen = stateMachine != nullptr &&
-                              (stateMachine->is("main_menu"_s) ||
-                               stateMachine->is("device_list"_s));
+    const bool atIdleScreen = isAtIdleScreen();
     // Read progress before the clock: a draw loop on the other core can
     // advance it meanwhile, and the age must not wrap.
     const uint32_t menuMs = menuProgressMs.load(std::memory_order_relaxed);
