@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include "utils/psramTask.h"
 #include "display.h"
+#include "hardwareHealth.h"
 #include "esp_log.h"
 
 #ifdef SHORT_TIMEOUTS
@@ -70,6 +71,7 @@ inline void setupIdleMonitor() {
                 ESP_LOGI("IDLE", "Entering IDLE state - dimming screen");
             }
             
+            hardwareHealthHeartbeat();
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
     };

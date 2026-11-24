@@ -1,4 +1,5 @@
 #include "services/radHil.h"
+#include "services/hardwareHealth.h"
 #include "menus.h"
 #include "utils/psramTask.h"
 
@@ -285,6 +286,8 @@ void drawMenuTask(void *pvParameters) {
 
     while (isInCorrectState() && !menuTaskExitRequested) {
         radHilProgress(stateMachine->is("main_menu"_s));
+        // A heartbeat from another task alone must not hide a frozen menu.
+        if (isInMainMenu()) hardwareHealthMenuProgress();
         // Shoulder button polling for tab switching (main_menu only)
         if (isInMainMenu() && tabBarHeight > 0) {
             bool curLeftShoulder = digitalRead(pins::BTN_L_SHOULDER);
@@ -511,6 +514,7 @@ void drawDeviceListTask(void *pvParameters) {
     while (isInCorrectState() && !deviceListTaskExitRequested) {
         // The normal device picker is idle: no remote control is active.
         radHilProgress(true);
+        hardwareHealthMenuProgress();
         int rawEncoderValue = rightEncoder.readEncoder();
         currentOption = rawEncoderValue;
         
