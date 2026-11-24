@@ -2,6 +2,7 @@
 
 #include "WiFi.h"
 #include "devices/device.h"
+#include "hardwareHealth.h"
 #include "state/remote.h"
 
 WiFiManager wm;
@@ -19,6 +20,7 @@ void initWM() {
 
     // When RADR gets an IP, share WiFi credentials with paired OSSM (if any)
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        hardwareHealthWifiConnected(info.got_ip.ip_info.ip.addr);
         xTimerPendFunctionCall([](void*, uint32_t) {
             if (device != nullptr && device->isConnected) {
                 device->onWiFiConnected();

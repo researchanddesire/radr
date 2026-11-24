@@ -16,6 +16,14 @@ void initStateMachine()
     }
 }
 
+bool isAtIdleScreen() {
+    using namespace sml;
+    // After boot the RADR rests on the device list; the main menu is the
+    // other idle screen. Both draw loops report health progress.
+    return stateMachine != nullptr &&
+           (stateMachine->is("main_menu"_s) || stateMachine->is("device_list"_s));
+}
+
 void fireStateMachineDoneEvent() {
     if (stateMachine) {
         stateMachine->process_event(done{});

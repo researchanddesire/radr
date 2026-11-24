@@ -19,4 +19,7 @@ extern sml::sm<ossm_remote_state, sml::thread_safe<ESP32RecursiveMutex>, sml::lo
 // Initialize the state machine
 void initStateMachine();
 
+// True on the main menu or the device list, the screens the RADR rests on.
+bool isAtIdleScreen();
+
 #endif // REMOTE_H
