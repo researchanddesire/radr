@@ -56,6 +56,31 @@ inline Step next(const std::string &state, const std::string &mode,
     return Step::Request;
 }
 
+enum class ConnectAction {
+    None,        // send no mode request now
+    PressOnce,   // one request; the follower asks again if it is lost
+    PressTwice,  // OSSM firmware without RAD BLE replies (no follower)
+};
+
+/// What the RADR does about `mode` right after connecting, given what it
+/// could read of the OSSM's state. A request is a button press: on the error
+/// page the first press opens help and the second restarts the OSSM, so an
+/// unknown state is never pressed through. While the OSSM homes a press is
+/// ignored, and the follower (when `followerAvailable`) asks once homing
+/// ends.
+inline ConnectAction connectAction(bool stateKnown, const std::string &state,
+                                   const std::string &mode,
+                                   bool followerAvailable) {
+    if (!stateKnown || mode.empty()) return ConnectAction::None;
+    if (startsWith(state, mode.c_str())) return ConnectAction::None;
+    if (startsWith(state, "error")) return ConnectAction::None;
+    if (state == "idle" || startsWith(state, "homing"))
+        return ConnectAction::None;
+    if (followerAvailable || mode != "strokeEngine")
+        return ConnectAction::PressOnce;
+    return ConnectAction::PressTwice;
+}
+
 /// State name from a RAD BLE state.read result: {"state":"menu.idle"} or
 /// {"state":{"state":"menu.idle",...}}. False when there is none.
 inline bool parseStateName(const std::string &resultJson, std::string &state) {

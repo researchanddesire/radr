@@ -19,9 +19,11 @@ OssmRadBle::~OssmRadBle() {
 
 void OssmRadBle::attach(NimBLERemoteCharacteristic *command,
                         NimBLERemoteCharacteristic *response) {
+    // Detaching is final: a connection task still setting up a destroyed
+    // device must not bring the client back.
+    if (detached) return;
     commandCharacteristic = command;
     responseCharacteristic = response;
-    detached = false;
 }
 
 void OssmRadBle::detach() {

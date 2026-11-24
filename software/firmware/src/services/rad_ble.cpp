@@ -259,7 +259,7 @@ radble::Result requestTarget(const String& path, JsonObjectConst args) {
             return radble::Result::failure("invalid_value",
                                            "A device-list index is required");
         const int index = args["index"].as<int>();
-        if (index < 0 || index >= static_cast<int>(getDiscoveredDevices().size()))
+        if (index < 0 || index >= static_cast<int>(getDiscoveredDeviceCount()))
             return radble::Result::failure("invalid_value",
                                            "Device-list index is out of range");
         currentOption = index;
@@ -404,12 +404,9 @@ radble::Result requestTarget(const String& path, JsonObjectConst args) {
     return targetResult(path, selectActiveMenuItem(item));
 }
 
-void requestNetworkOtaTask(void*) {
-    vTaskDelay(pdMS_TO_TICKS(500));
-    if (stateMachine == nullptr) {
-        vTaskDelete(nullptr);
-        return;
-    }
+// vTaskDelete(nullptr) never returns, so the String lives in here.
+void openUpdateMenu() {
+    if (stateMachine == nullptr) return;
     String state = stateName();
     if (state == "main_menu") {
         selectRadrMenuSurface();
@@ -420,6 +417,11 @@ void requestNetworkOtaTask(void*) {
     if (state == "settings_menu") {
         selectActiveMenuItem(MenuItemE::UPDATE);
     }
+}
+
+void requestNetworkOtaTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    openUpdateMenu();
     vTaskDelete(nullptr);
 }
 
@@ -563,7 +565,7 @@ radble::Result handleCommand(JsonObjectConst request, void*) {
         }
         else if (path == "connectivity.bleScan") {
             document["scanning"] = NimBLEDevice::getScan()->isScanning();
-            document["discovered"] = getDiscoveredDevices().size();
+            document["discovered"] = getDiscoveredDeviceCount();
         } else if (path == "connectivity.wifi") {
             document["connected"] = WiFi.status() == WL_CONNECTED;
             document["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
@@ -645,7 +647,7 @@ radble::Result handleCommand(JsonObjectConst request, void*) {
             else if (path == "event.disconnected")
                 accepted = stateMachine->process_event(disconnected_event{});
             else if (path == "event.devicesFound") {
-                if (getDiscoveredDevices().empty())
+                if (getDiscoveredDeviceCount() == 0)
                     return radble::Result::failure(
                         "invalid_state", "The current scan has no devices");
                 accepted = stateMachine->process_event(devices_found_event{});
@@ -937,7 +939,7 @@ String snapshot(radble::Surface surface, void*) {
             document["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
             document["ip"] = WiFi.localIP().toString();
             document["scanning"] = NimBLEDevice::getScan()->isScanning();
-            document["discovered"] = getDiscoveredDevices().size();
+            document["discovered"] = getDiscoveredDeviceCount();
             document["deviceConnected"] = device != nullptr && device->isConnected;
             document["centralConnections"] =
                 NimBLEDevice::getConnectedClients().size();

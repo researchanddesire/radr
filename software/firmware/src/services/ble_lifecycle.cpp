@@ -5,6 +5,8 @@
 #include <esp_log.h>
 
 #include "devices/device.h"
+#include "pages/controller.h"
+#include "pages/menus.h"
 #include "services/leftEncoderMonitor.h"
 #include "services/rad_ble.h"
 
@@ -27,8 +29,22 @@ BleShutdownResult shutdownBleForNetwork() {
         if (device->needsPersistentLeftEncoderMonitoring()) {
             stopLeftEncoderMonitoring();
         }
-        delete device;  // disconnects and clears the client callbacks
+        // No UI task may still be drawing the device when it is deleted.
+        stopMenuTask();
+        stopControllerTask();
+        Device *leaving = device;
         device = nullptr;
+        Device::destroy(leaving);  // disconnects and clears the callbacks
+    }
+    // NimBLE deinit deletes every client, including one a destroyed device's
+    // connection task may still be using.
+    if (!Device::waitForConnectionTasks(8000)) {
+        ESP_LOGE(BLE_TAG, "A BLE connection task is still running; not stopping BLE");
+        result.freeInternal =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        result.largestInternal =
+            heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        return result;
     }
 
     NimBLEScan *scan = NimBLEDevice::getScan();

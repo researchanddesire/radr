@@ -15,6 +15,7 @@
 #include <structs/SettingPercents.h>
 
 #include "../../device.h"
+#include "ossm_command_logic.h"
 #include "ossm_mode_follow_logic.h"
 #include "ossm_rad_ble.h"
 #include "ossm_state.h"
@@ -92,9 +93,18 @@ class OSSM : public Device {
         };
     }
 
+    // The mode follower and the settings tasks keep the RAD BLE client
+    // after this device is gone; NimBLE may free its characteristics (BLE
+    // shutdown for updates) before the delayed delete runs.
+    void onDestroy() override { radBle->detach(); }
+
     ~OSSM() override { radBle->detach(); }
 
     const char *getName() override { return "OSSM"; }
+
+    // onConnect() only talks BLE (state, patterns, pairing, Wi-Fi config
+    // from RAM), so the connection task can use a PSRAM stack.
+    bool connectsWithoutFlash() const override { return true; }
     NimBLEUUID getServiceUUID() override { return NimBLEUUID(OSSM_SERVICE_ID); }
 
     void drawControls() override {
@@ -273,46 +283,60 @@ class OSSM : public Device {
 
         // finally, we set inital preferences and go to the active mode
         send("speedKnobLimit", "false");
+
+        auto command = characteristics.find("command");
+        auto response = characteristics.find("response");
+        NimBLERemoteCharacteristic *responseCharacteristic =
+            response != characteristics.end() ? response->second.pCharacteristic
+                                              : nullptr;
+        if (responseCharacteristic != nullptr) {
+            // RAD BLE replies are indications, which cannot exceed the MTU.
+            // A new client connects without exchanging it (see device.cpp).
+            if (pClient != nullptr && pClient->getMTU() < 247) {
+                pClient->exchangeMTU();
+            }
+            radBle->attach(command != characteristics.end()
+                               ? command->second.pCharacteristic
+                               : nullptr,
+                           responseCharacteristic);
+        }
+
         // A mode request is a button press on the OSSM. On its error page the
         // first press opens help and the second restarts the OSSM, which then
-        // homes again and drops this connection. Leave the error on screen.
-        const std::string stateJson = readString("state");
-        OssmStateInfo current;
-        const bool ossmShowsError =
-            parseOssmState(stateJson.c_str(), stateJson.size(), current) &&
-            ossm_mode_follow::startsWith(current.state, "error");
-        if (ossmShowsError) {
-            ESP_LOGW(TAG, "OSSM shows %s; not requesting a mode",
-                     current.state.c_str());
-        } else if (operationMode == OssmMode::SimplePenetration) {
-            send("command", "go:simplePenetration");
-        } else {
-            send("command", "go:strokeEngine");
-            vTaskDelay(pdMS_TO_TICKS(250));
-            // TODO: A bug on AJ's dev unit requires two "go:strokeEngine"
-            // commands.
-            send("command", "go:strokeEngine");
+        // homes again and drops this connection. So the RADR presses only
+        // when it knows what the OSSM shows: a state it cannot read is
+        // treated like an error page (on the Test Rig an unreadable state
+        // let two presses restart an OSSM on its error page).
+        const char *wanted = operationMode == OssmMode::SimplePenetration
+                                 ? "simplePenetration"
+                                 : "strokeEngine";
+        std::string ossmState;
+        const bool stateKnown = readOssmState(ossmState);
+        switch (ossm_mode_follow::connectAction(stateKnown, ossmState, wanted,
+                                                radBle->isAvailable())) {
+            case ossm_mode_follow::ConnectAction::None:
+                ESP_LOGW(TAG, "OSSM shows %s; not requesting %s now",
+                         stateKnown ? ossmState.c_str() : "an unknown state",
+                         wanted);
+                break;
+            case ossm_mode_follow::ConnectAction::PressOnce:
+                send("command", ossm_command::go(wanted));
+                break;
+            case ossm_mode_follow::ConnectAction::PressTwice:
+                send("command", ossm_command::go(wanted));
+                vTaskDelay(pdMS_TO_TICKS(250));
+                // TODO: A bug on AJ's dev unit requires two "go:strokeEngine"
+                // commands. Only for OSSM firmware without RAD BLE replies,
+                // where no follower can ask again.
+                send("command", ossm_command::go(wanted));
+                break;
         }
         vTaskDelay(pdMS_TO_TICKS(250));
 
-        // RAD BLE replies are indications, which cannot exceed the MTU. A
-        // new client connects without exchanging it (see device.cpp).
-        if (pClient != nullptr && pClient->getMTU() < 247) {
-            pClient->exchangeMTU();
-        }
-        auto command = characteristics.find("command");
-        auto response = characteristics.find("response");
-        radBle->attach(command != characteristics.end()
-                           ? command->second.pCharacteristic
-                           : nullptr,
-                       response != characteristics.end()
-                           ? response->second.pCharacteristic
-                           : nullptr);
         // The request above is lost if the OSSM is homing, and starts a home
-        // that ends in the OSSM menu if it is not homed yet.
-        followWantedMode(operationMode == OssmMode::SimplePenetration
-                             ? "simplePenetration"
-                             : "strokeEngine");
+        // that ends in the OSSM menu if it is not homed yet; the follower asks
+        // again once the OSSM is back in its menu.
+        followWantedMode(wanted);
 
         isConnected = true;
         isFirstConnect = false;
@@ -529,9 +553,8 @@ class OSSM : public Device {
         }
         settings.speed = speed;
         updateMenuButtonState();
-        speed = constrain(speed, 0, 100);
         return send("command",
-                    std::string("set:speed:") + std::to_string(speed));
+                    ossm_command::set(ossm_command::Setting::Speed, speed));
     }
 
     float getDepth() { return constrain(settings.depth, 0.0f, 100.0f); }
@@ -543,9 +566,8 @@ class OSSM : public Device {
             return true;
         }
         settings.depth = depth;
-        depth = constrain(depth, 0, 100);
         return send("command",
-                    std::string("set:depth:") + std::to_string(depth));
+                    ossm_command::set(ossm_command::Setting::Depth, depth));
     }
 
     float getStroke() { return constrain(settings.stroke, 0.0f, 100.0f); }
@@ -557,9 +579,8 @@ class OSSM : public Device {
             return true;
         }
         settings.stroke = stroke;
-        stroke = constrain(stroke, 0, 100);
         return send("command",
-                    std::string("set:stroke:") + std::to_string(stroke));
+                    ossm_command::set(ossm_command::Setting::Stroke, stroke));
     }
 
     bool setSensation(int sensation) {
@@ -569,9 +590,8 @@ class OSSM : public Device {
             return true;
         }
         settings.sensation = sensation;
-        sensation = constrain(sensation, 0, 100);
         return send("command",
-                    std::string("set:sensation:") + std::to_string(sensation));
+                    ossm_command::set(ossm_command::Setting::Sensation, sensation));
     }
 
     bool setPattern(int pattern) {
@@ -580,6 +600,7 @@ class OSSM : public Device {
             patternName = EMPTY_STRING;
             return false;
         }
+        if (pattern < 0) return false;  // a negative index would read before menu[0]
         if (pattern == static_cast<int>(settings.pattern)) {
             return true;
         }
@@ -593,8 +614,8 @@ class OSSM : public Device {
             patternNameDisplay->setColor(Colors::textForeground);
         }
 
-        return send("command",
-                    std::string("set:pattern:") + std::to_string(patternIdx));
+        return send("command", ossm_command::set(ossm_command::Setting::Pattern,
+                                                 patternIdx));
     }
 
     void syncRightEncoder() {
@@ -662,6 +683,34 @@ class OSSM : public Device {
     const char *getLeftEncoderParameterName() const override { return "Speed"; }
 
   private:
+    // The OSSM's state name ("menu.idle", "error.idle", ...). Uses a RAD BLE
+    // state.read when the OSSM answers those: a short indication that
+    // arrives whole. The legacy state characteristic needs a long read,
+    // which the OSSM can rebuild between its parts (mixed or cut-short JSON,
+    // seen on the Test Rig as "JSON parse failed"). Tries three times; false
+    // when the state stays unknown.
+    bool readOssmState(std::string &state) {
+        for (int attempt = 0; attempt < 3 && !connectionAborted(); attempt++) {
+            if (attempt > 0) vTaskDelay(pdMS_TO_TICKS(400));
+            if (radBle->isAvailable()) {
+                const ossm_rad_ble::Reply reply =
+                    radBle->request("state.read", nullptr);
+                if (reply.ok &&
+                    ossm_mode_follow::parseStateName(reply.resultJson, state))
+                    return true;
+                continue;
+            }
+            const std::string json = readString("state");
+            OssmStateInfo info;
+            if (parseOssmState(json.c_str(), json.size(), info) &&
+                !info.state.empty()) {
+                state = info.state;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Records `mode` as the one the RADR wants and, unless one is running,
     // starts a follower that asks for it again once the OSSM stops homing
     // (ossm_mode_follow_logic.h). The follower only holds the shared RAD BLE
@@ -679,9 +728,16 @@ class OSSM : public Device {
         }
     }
 
+    // exitPsramTask() never returns, so nothing may still be in scope
+    // there: a shared_ptr left on the task's stack is never released and
+    // leaked one OssmRadBle (about 600 B of internal RAM) per connection.
     static void modeFollowTask(void *param) {
+        followUntilDone(static_cast<std::shared_ptr<OssmRadBle> *>(param));
+        exitPsramTask();
+    }
+
+    static void followUntilDone(std::shared_ptr<OssmRadBle> *holder) {
         using ossm_mode_follow::Step;
-        auto *holder = static_cast<std::shared_ptr<OssmRadBle> *>(param);
         std::shared_ptr<OssmRadBle> client = *holder;
         delete holder;
 
@@ -724,12 +780,12 @@ class OSSM : public Device {
             }
             ESP_LOGI("OSSM_FOLLOW", "OSSM %s: asking for %s again", state.c_str(),
                      mode.c_str());
-            if (!client->sendCommand("go:" + mode)) break;
+            const std::string command = ossm_command::go(mode);
+            if (command.empty() || !client->sendCommand(command)) break;
             ++requests;
             vTaskDelay(pdMS_TO_TICKS(ossm_mode_follow::kRequestSettleMs));
         }
         client->endFollow();
-        exitPsramTask();
     }
 
     void shareWiFiCredentials() {

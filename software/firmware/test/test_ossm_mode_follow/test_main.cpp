@@ -72,6 +72,50 @@ void test_rejects_results_without_a_state() {
     TEST_ASSERT_FALSE(parseStateName(R"({"state":{"name":"menu"}})", state));
 }
 
+void test_connect_never_presses_an_unknown_state() {
+    // Test Rig 2026-11-23: an unreadable state let two presses restart an
+    // OSSM on its error page.
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(false, "", "strokeEngine", true));
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(false, "", "strokeEngine", false));
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(false, "menu.idle", "strokeEngine", false));
+}
+
+void test_connect_never_presses_an_error_page() {
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "error.idle", "strokeEngine", true));
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "error.help", "strokeEngine", false));
+}
+
+void test_connect_leaves_homing_to_the_follower() {
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "homing.forward", "strokeEngine", true));
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "idle", "simplePenetration", true));
+}
+
+void test_connect_presses_once_from_the_menu_with_a_follower() {
+    TEST_ASSERT_EQUAL(ConnectAction::PressOnce,
+                      connectAction(true, "menu.idle", "strokeEngine", true));
+    TEST_ASSERT_EQUAL(ConnectAction::PressOnce,
+                      connectAction(true, "menu.idle", "simplePenetration", false));
+}
+
+void test_connect_presses_twice_only_on_old_firmware_in_the_menu() {
+    TEST_ASSERT_EQUAL(ConnectAction::PressTwice,
+                      connectAction(true, "menu.idle", "strokeEngine", false));
+}
+
+void test_connect_does_nothing_in_the_wanted_mode() {
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "strokeEngine.idle", "strokeEngine", true));
+    TEST_ASSERT_EQUAL(ConnectAction::None,
+                      connectAction(true, "menu.idle", "", true));
+}
+
 }  // namespace
 
 int main(int, char **) {
@@ -86,5 +130,11 @@ int main(int, char **) {
     RUN_TEST(test_parses_flat_state_read_result);
     RUN_TEST(test_parses_nested_state_read_result);
     RUN_TEST(test_rejects_results_without_a_state);
+    RUN_TEST(test_connect_never_presses_an_unknown_state);
+    RUN_TEST(test_connect_never_presses_an_error_page);
+    RUN_TEST(test_connect_leaves_homing_to_the_follower);
+    RUN_TEST(test_connect_presses_once_from_the_menu_with_a_follower);
+    RUN_TEST(test_connect_presses_twice_only_on_old_firmware_in_the_menu);
+    RUN_TEST(test_connect_does_nothing_in_the_wanted_mode);
     return UNITY_END();
 }

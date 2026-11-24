@@ -112,7 +112,9 @@ static void followOssmFlow(const char *prefix) {
     }
 }
 
-static void ossmUpdateTask(void *) {
+// Runs the request; returns (so its strings are freed) before the task
+// deletes itself.
+static void ossmUpdateTaskSteps() {
     ESP_LOGW(UPDATE_TAG, "[MEM] request: internal free=%u largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
@@ -125,18 +127,20 @@ static void ossmUpdateTask(void *) {
         // never fired). Treat it as a disconnect so the RADR cleans up.
         updateStatusText("Lost the OSSM connection.");
         fireStateMachineOssmLinkLostEvent();
-        vTaskDelete(nullptr);
         return;
     }
 
     if (!pairingInfoHasWifi(pairingInfo)) {
         fireStateMachineOssmNoWifiEvent();
-        vTaskDelete(nullptr);
         return;
     }
 
     if (device != nullptr) device->onUpdate();
     followOssmFlow("update");
+}
+
+static void ossmUpdateTask(void *) {
+    ossmUpdateTaskSteps();
     vTaskDelete(nullptr);
 }
 
